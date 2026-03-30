@@ -1,21 +1,37 @@
 """
 ClubPay — Pasarela de Pago Crypto
-Gateway de pagos con criptomonedas (USDT TRC-20, BTC).
-Sin intermediarios. Comisiones mínimas.
+Gateway de pagos con criptomonedas. Sin intermediarios.
+Los pagos van a la wallet de ClubPay, se descuenta el 1.5% de comisión,
+y el comercio puede retirar su saldo cuando quiera.
 
-Endpoints:
-  GET  /                        → info
-  POST /v1/auth/register        → registrar comercio
-  POST /v1/auth/login           → login comercio
-  GET  /v1/merchant/me          → datos del comercio
-  POST /v1/merchant/wallets     → configurar wallets del comercio
-  POST /v1/payments/create      → crear cobro
-  GET  /v1/payments/{id}        → estado de un cobro
-  GET  /v1/payments             → listar cobros del comercio
-  GET  /checkout/{id}           → página de pago para el comprador
-  GET  /dashboard               → panel del comercio
+Endpoints públicos:
+  GET  /                            → info
+  GET  /checkout/{id}               → página de pago
+  GET  /v1/payments/{id}/public     → estado de pago (sin auth)
+
+Endpoints comercio:
+  POST /v1/auth/register            → registrar comercio
+  POST /v1/auth/login               → login
+  GET  /v1/merchant/me              → datos del comercio
+  POST /v1/merchant/wallets         → configurar wallet de retiro
+  POST /v1/payments/create          → crear cobro
+  GET  /v1/payments/{id}            → detalle de pago
+  GET  /v1/payments                 → listar pagos
+  GET  /v1/merchant/balance         → saldo disponible
+  POST /v1/merchant/withdraw        → solicitar retiro
+  GET  /dashboard                   → panel del comercio
+
+Endpoints admin (dueño):
+  GET  /admin                       → panel admin
+  GET  /v1/admin/stats              → estadísticas globales
+  GET  /v1/admin/merchants          → listar comercios
+  GET  /v1/admin/payments           → todos los pagos
+  GET  /v1/admin/withdrawals        → solicitudes de retiro
+  POST /v1/admin/withdrawals/{id}/approve → aprobar retiro
+  POST /v1/admin/withdrawals/{id}/reject  → rechazar retiro
 """
 
+import math
 import os
 import time
 import secrets
@@ -38,23 +54,30 @@ except ImportError:
 # ════════════════════════════════════════════
 # CONFIG
 # ════════════════════════════════════════════
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
-DB_PATH = os.getenv("DB_PATH", "/tmp/clubpay.db")
-CLUBPAY_FEE_PERCENT = float(os.getenv("CLUBPAY_FEE", "1.5"))  # 1.5% comisión
-CHECK_INTERVAL = 30  # segundos entre chequeos de blockchain
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8001")
+DB_PATH = os.getenv("DB_PATH", "./clubpay.db")
+CLUBPAY_FEE = float(os.getenv("CLUBPAY_FEE", "1.5"))  # porcentaje
 
-# APIs de blockchain (gratis)
+# WALLETS DE CLUBPAY — acá llegan TODOS los pagos
+CLUBPAY_WALLET_USDT = os.getenv("CLUBPAY_WALLET_USDT", "")  # TRC-20
+CLUBPAY_WALLET_BTC = os.getenv("CLUBPAY_WALLET_BTC", "")
+
+# Admin password
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "clubpay-admin-2026")
+
+# APIs blockchain
 TRONGRID_URL = "https://api.trongrid.io"
 BLOCKSTREAM_URL = "https://blockstream.info/api"
 COINGECKO_URL = "https://api.coingecko.com/api/v3"
+CHECK_INTERVAL = 30
 
 # Cache de precios
-PRICES = {"btc_usd": None, "usdt_usd": 1.0, "last_update": None}
+PRICES = {"btc_usd": None, "usdt_usd": 1.0, "blue_ars": None, "oficial_ars": None, "last_update": None}
 
 app = FastAPI(
     title="ClubPay — Pasarela Crypto",
-    description="Gateway de pagos con criptomonedas. Sin intermediarios.",
-    version="0.1.0",
+    description="Gateway de pagos crypto. Comisión 1.5%. Sin intermediarios.",
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -81,6 +104,9 @@ def init_db():
             wallet_usdt_trc20 TEXT DEFAULT '',
             wallet_btc TEXT DEFAULT '',
             webhook_url TEXT DEFAULT '',
+            balance_usd REAL DEFAULT 0,
+            total_received_usd REAL DEFAULT 0,
+            total_fees_usd REAL DEFAULT 0,
             created_at TEXT NOT NULL,
             active INTEGER DEFAULT 1
         );
@@ -89,19 +115,35 @@ def init_db():
             id TEXT PRIMARY KEY,
             merchant_id INTEGER NOT NULL,
             amount_usd REAL NOT NULL,
+            amount_ars REAL DEFAULT 0,
+            fee_usd REAL DEFAULT 0,
+            net_usd REAL DEFAULT 0,
             amount_crypto REAL,
             crypto TEXT NOT NULL,
             description TEXT DEFAULT '',
-            status TEXT DEFAULT 'pending',
             customer_email TEXT DEFAULT '',
-            merchant_wallet TEXT NOT NULL,
+            clubpay_wallet TEXT NOT NULL,
             expected_amount TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
             tx_hash TEXT DEFAULT '',
             paid_at TEXT DEFAULT '',
             expires_at TEXT NOT NULL,
             created_at TEXT NOT NULL,
             webhook_sent INTEGER DEFAULT 0,
             metadata TEXT DEFAULT '{}',
+            FOREIGN KEY (merchant_id) REFERENCES merchants(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            merchant_id INTEGER NOT NULL,
+            amount_usd REAL NOT NULL,
+            crypto TEXT NOT NULL,
+            destination_wallet TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            tx_hash TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            processed_at TEXT DEFAULT '',
             FOREIGN KEY (merchant_id) REFERENCES merchants(id)
         );
     """)
@@ -121,137 +163,139 @@ init_db()
 # ════════════════════════════════════════════
 # HELPERS
 # ════════════════════════════════════════════
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+def hash_pw(pw):
+    return hashlib.sha256(pw.encode()).hexdigest()
 
 
-def generate_api_key():
+def gen_api_key():
     return f"cpk_{secrets.token_hex(20)}"
 
 
-def generate_api_secret():
+def gen_api_secret():
     return f"cps_{secrets.token_hex(24)}"
 
 
-def generate_payment_id():
+def gen_payment_id():
     return f"pay_{secrets.token_hex(12)}"
 
 
 def verify_merchant(api_key):
-    """Verifica API key y devuelve el merchant."""
     db = get_db()
-    merchant = db.execute(
-        "SELECT * FROM merchants WHERE api_key = ? AND active = 1", (api_key,)
-    ).fetchone()
+    m = db.execute("SELECT * FROM merchants WHERE api_key = ? AND active = 1", (api_key,)).fetchone()
     db.close()
-    if not merchant:
+    if not m:
         raise HTTPException(401, "API key inválida")
-    return dict(merchant)
+    return dict(m)
 
 
 def get_api_key(authorization: str = Header(default=None)):
     if not authorization:
-        raise HTTPException(401, "Header requerido: Authorization: Bearer <api_key>")
+        raise HTTPException(401, "Header: Authorization: Bearer <api_key>")
     return authorization.replace("Bearer ", "").strip()
 
 
+def verify_admin(authorization: str = Header(default=None)):
+    if not authorization:
+        raise HTTPException(401, "Admin auth required")
+    key = authorization.replace("Bearer ", "").strip()
+    if key != ADMIN_PASSWORD:
+        raise HTTPException(403, "Admin password incorrecta")
+    return True
+
+
 # ════════════════════════════════════════════
-# PRECIO CRYPTO
+# PRECIOS
 # ════════════════════════════════════════════
 def fetch_prices():
     try:
-        r = req.get(
-            f"{COINGECKO_URL}/simple/price?ids=bitcoin&vs_currencies=usd",
-            timeout=10,
-        )
-        data = r.json()
-        PRICES["btc_usd"] = data["bitcoin"]["usd"]
-        PRICES["usdt_usd"] = 1.0
-        PRICES["last_update"] = datetime.now(timezone.utc).isoformat()
+        r = req.get(f"{COINGECKO_URL}/simple/price?ids=bitcoin&vs_currencies=usd", timeout=10)
+        PRICES["btc_usd"] = r.json()["bitcoin"]["usd"]
     except Exception:
         pass
+    try:
+        r = req.get("https://api.bluelytics.com.ar/v2/latest", timeout=10)
+        d = r.json()
+        PRICES["blue_ars"] = d["blue"]["value_sell"]
+        PRICES["oficial_ars"] = d["oficial"]["value_sell"]
+    except Exception:
+        pass
+    PRICES["last_update"] = datetime.now(timezone.utc).isoformat()
+
+
+def usd_to_ars(usd):
+    if PRICES["blue_ars"]:
+        return round(usd * PRICES["blue_ars"], 2)
+    return 0
 
 
 def usd_to_crypto(amount_usd, crypto):
-    """Convierte USD a cantidad de crypto. Agrega centavos únicos para identificar pago."""
     if crypto == "usdt_trc20":
-        # USDT = 1:1 con USD, agregar centavos únicos
-        unique_cents = secrets.randbelow(99) + 1
-        return round(amount_usd + unique_cents / 10000, 4)
+        unique = secrets.randbelow(99) + 1
+        return round(amount_usd + unique / 10000, 4)
     elif crypto == "btc":
         if not PRICES["btc_usd"]:
             fetch_prices()
         if not PRICES["btc_usd"]:
             raise HTTPException(503, "No se pudo obtener precio de BTC")
-        btc_amount = amount_usd / PRICES["btc_usd"]
-        # Agregar satoshis únicos para identificar
-        unique_sats = secrets.randbelow(999) + 1
-        return round(btc_amount + unique_sats / 100000000, 8)
+        btc = amount_usd / PRICES["btc_usd"]
+        unique = secrets.randbelow(999) + 1
+        return round(btc + unique / 100000000, 8)
     raise HTTPException(400, "Crypto no soportada. Usar: usdt_trc20, btc")
 
 
 # ════════════════════════════════════════════
 # MODELOS
 # ════════════════════════════════════════════
-class RegisterRequest(BaseModel):
+class RegisterReq(BaseModel):
     email: str
     password: str
     business_name: str
 
-
-class LoginRequest(BaseModel):
+class LoginReq(BaseModel):
     email: str
     password: str
 
-
-class WalletRequest(BaseModel):
+class WalletReq(BaseModel):
     wallet_usdt_trc20: Optional[str] = ""
     wallet_btc: Optional[str] = ""
     webhook_url: Optional[str] = ""
 
-
-class PaymentRequest(BaseModel):
+class PaymentReq(BaseModel):
     amount_usd: float
-    crypto: str  # "usdt_trc20" o "btc"
+    crypto: str
     description: Optional[str] = ""
     customer_email: Optional[str] = ""
     metadata: Optional[str] = "{}"
 
+class WithdrawReq(BaseModel):
+    amount_usd: float
+    crypto: str  # a qué crypto quiere retirar
+
 
 # ════════════════════════════════════════════
-# ENDPOINTS — AUTH
+# AUTH
 # ════════════════════════════════════════════
 @app.post("/v1/auth/register")
-def register(data: RegisterRequest):
+def register(data: RegisterReq):
     if len(data.password) < 6:
         raise HTTPException(400, "Password mínimo 6 caracteres")
-
-    api_key = generate_api_key()
-    api_secret = generate_api_secret()
-
+    api_key = gen_api_key()
+    api_secret = gen_api_secret()
     db = get_db()
     try:
         db.execute(
-            """INSERT INTO merchants
-            (email, password_hash, business_name, api_key, api_secret, created_at)
+            """INSERT INTO merchants (email, password_hash, business_name, api_key, api_secret, created_at)
             VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                data.email.lower().strip(),
-                hash_password(data.password),
-                data.business_name.strip(),
-                api_key,
-                api_secret,
-                datetime.now(timezone.utc).isoformat(),
-            ),
+            (data.email.lower().strip(), hash_pw(data.password), data.business_name.strip(),
+             api_key, api_secret, datetime.now(timezone.utc).isoformat()),
         )
         db.commit()
     except sqlite3.IntegrityError:
         db.close()
         raise HTTPException(409, "Email ya registrado")
     db.close()
-
     return {
-        "message": "Comercio registrado exitosamente",
+        "message": "Comercio registrado",
         "api_key": api_key,
         "api_secret": api_secret,
         "important": "Guardá tu api_secret, no se puede recuperar.",
@@ -259,329 +303,386 @@ def register(data: RegisterRequest):
 
 
 @app.post("/v1/auth/login")
-def login(data: LoginRequest):
+def login(data: LoginReq):
     db = get_db()
-    merchant = db.execute(
-        "SELECT * FROM merchants WHERE email = ?", (data.email.lower().strip(),)
-    ).fetchone()
+    m = db.execute("SELECT * FROM merchants WHERE email = ?", (data.email.lower().strip(),)).fetchone()
     db.close()
-
-    if not merchant or merchant["password_hash"] != hash_password(data.password):
+    if not m or m["password_hash"] != hash_pw(data.password):
         raise HTTPException(401, "Email o password incorrectos")
-
-    return {
-        "message": "Login exitoso",
-        "api_key": merchant["api_key"],
-        "business_name": merchant["business_name"],
-        "merchant_id": merchant["id"],
-    }
+    return {"message": "Login exitoso", "api_key": m["api_key"], "business_name": m["business_name"]}
 
 
 # ════════════════════════════════════════════
-# ENDPOINTS — MERCHANT
+# MERCHANT
 # ════════════════════════════════════════════
 @app.get("/v1/merchant/me")
 def merchant_me(authorization: str = Header(default=None)):
-    key = get_api_key(authorization)
-    merchant = verify_merchant(key)
+    m = verify_merchant(get_api_key(authorization))
     return {
-        "id": merchant["id"],
-        "email": merchant["email"],
-        "business_name": merchant["business_name"],
-        "wallet_usdt_trc20": merchant["wallet_usdt_trc20"],
-        "wallet_btc": merchant["wallet_btc"],
-        "webhook_url": merchant["webhook_url"],
-        "created_at": merchant["created_at"],
+        "id": m["id"], "email": m["email"], "business_name": m["business_name"],
+        "wallet_usdt_trc20": m["wallet_usdt_trc20"], "wallet_btc": m["wallet_btc"],
+        "webhook_url": m["webhook_url"],
+        "balance_usd": round(m["balance_usd"], 2),
+        "balance_ars": usd_to_ars(m["balance_usd"]),
+        "total_received_usd": round(m["total_received_usd"], 2),
+        "total_received_ars": usd_to_ars(m["total_received_usd"]),
+        "total_fees_usd": round(m["total_fees_usd"], 2),
     }
 
 
 @app.post("/v1/merchant/wallets")
-def update_wallets(data: WalletRequest, authorization: str = Header(default=None)):
-    key = get_api_key(authorization)
-    merchant = verify_merchant(key)
-
+def update_wallets(data: WalletReq, authorization: str = Header(default=None)):
+    m = verify_merchant(get_api_key(authorization))
     db = get_db()
     db.execute(
-        """UPDATE merchants SET
-            wallet_usdt_trc20 = ?,
-            wallet_btc = ?,
-            webhook_url = ?
-        WHERE id = ?""",
-        (
-            data.wallet_usdt_trc20 or merchant["wallet_usdt_trc20"],
-            data.wallet_btc or merchant["wallet_btc"],
-            data.webhook_url or merchant["webhook_url"],
-            merchant["id"],
-        ),
+        "UPDATE merchants SET wallet_usdt_trc20=?, wallet_btc=?, webhook_url=? WHERE id=?",
+        (data.wallet_usdt_trc20 or m["wallet_usdt_trc20"],
+         data.wallet_btc or m["wallet_btc"],
+         data.webhook_url or m["webhook_url"], m["id"]),
     )
     db.commit()
     db.close()
     return {"message": "Wallets actualizadas"}
 
 
+@app.get("/v1/merchant/balance")
+def merchant_balance(authorization: str = Header(default=None)):
+    m = verify_merchant(get_api_key(authorization))
+    return {
+        "balance_usd": round(m["balance_usd"], 2),
+        "balance_ars": usd_to_ars(m["balance_usd"]),
+        "total_received_usd": round(m["total_received_usd"], 2),
+        "total_received_ars": usd_to_ars(m["total_received_usd"]),
+        "total_fees_usd": round(m["total_fees_usd"], 2),
+        "total_fees_ars": usd_to_ars(m["total_fees_usd"]),
+        "fee_percent": CLUBPAY_FEE,
+        "blue_ars": PRICES["blue_ars"],
+    }
+
+
+@app.post("/v1/merchant/withdraw")
+def request_withdrawal(data: WithdrawReq, authorization: str = Header(default=None)):
+    m = verify_merchant(get_api_key(authorization))
+    if data.amount_usd <= 0:
+        raise HTTPException(400, "Monto debe ser mayor a 0")
+    if data.amount_usd > m["balance_usd"]:
+        raise HTTPException(400, f"Saldo insuficiente. Tenés ${m['balance_usd']:.2f} USD")
+    if data.crypto == "usdt_trc20" and not m["wallet_usdt_trc20"]:
+        raise HTTPException(400, "Configurá tu wallet USDT primero")
+    if data.crypto == "btc" and not m["wallet_btc"]:
+        raise HTTPException(400, "Configurá tu wallet BTC primero")
+
+    dest = m["wallet_usdt_trc20"] if data.crypto == "usdt_trc20" else m["wallet_btc"]
+
+    db = get_db()
+    # Descontar del saldo
+    db.execute("UPDATE merchants SET balance_usd = balance_usd - ? WHERE id = ?", (data.amount_usd, m["id"]))
+    db.execute(
+        """INSERT INTO withdrawals (merchant_id, amount_usd, crypto, destination_wallet, created_at)
+        VALUES (?, ?, ?, ?, ?)""",
+        (m["id"], data.amount_usd, data.crypto, dest, datetime.now(timezone.utc).isoformat()),
+    )
+    db.commit()
+    db.close()
+    return {
+        "message": "Retiro solicitado. Se procesará en las próximas horas.",
+        "amount_usd": data.amount_usd,
+        "amount_ars": usd_to_ars(data.amount_usd),
+        "crypto": data.crypto,
+        "destination": dest,
+    }
+
+
 # ════════════════════════════════════════════
-# ENDPOINTS — PAYMENTS
+# PAYMENTS
 # ════════════════════════════════════════════
 @app.post("/v1/payments/create")
-def create_payment(data: PaymentRequest, authorization: str = Header(default=None)):
-    key = get_api_key(authorization)
-    merchant = verify_merchant(key)
-
+def create_payment(data: PaymentReq, authorization: str = Header(default=None)):
+    m = verify_merchant(get_api_key(authorization))
     if data.amount_usd <= 0:
         raise HTTPException(400, "Monto debe ser mayor a 0")
 
-    # Verificar que el comercio tenga wallet configurada
-    if data.crypto == "usdt_trc20" and not merchant["wallet_usdt_trc20"]:
-        raise HTTPException(400, "Configurá tu wallet USDT TRC-20 primero en /v1/merchant/wallets")
-    if data.crypto == "btc" and not merchant["wallet_btc"]:
-        raise HTTPException(400, "Configurá tu wallet BTC primero en /v1/merchant/wallets")
+    # El pago va a la wallet de ClubPay
+    if data.crypto == "usdt_trc20" and not CLUBPAY_WALLET_USDT:
+        raise HTTPException(503, "ClubPay USDT wallet no configurada")
+    if data.crypto == "btc" and not CLUBPAY_WALLET_BTC:
+        raise HTTPException(503, "ClubPay BTC wallet no configurada")
 
-    wallet = merchant["wallet_usdt_trc20"] if data.crypto == "usdt_trc20" else merchant["wallet_btc"]
+    wallet = CLUBPAY_WALLET_USDT if data.crypto == "usdt_trc20" else CLUBPAY_WALLET_BTC
     amount_crypto = usd_to_crypto(data.amount_usd, data.crypto)
-    payment_id = generate_payment_id()
+    fee = round(data.amount_usd * CLUBPAY_FEE / 100, 2)
+    net = round(data.amount_usd - fee, 2)
+    pid = gen_payment_id()
 
     db = get_db()
     db.execute(
         """INSERT INTO payments
-        (id, merchant_id, amount_usd, amount_crypto, crypto, description,
-         customer_email, merchant_wallet, expected_amount, expires_at, created_at, metadata)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            payment_id,
-            merchant["id"],
-            data.amount_usd,
-            amount_crypto,
-            data.crypto,
-            data.description,
-            data.customer_email,
-            wallet,
-            str(amount_crypto),
-            (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
-            datetime.now(timezone.utc).isoformat(),
-            data.metadata,
-        ),
+        (id, merchant_id, amount_usd, amount_ars, fee_usd, net_usd, amount_crypto, crypto,
+         description, customer_email, clubpay_wallet, expected_amount, expires_at, created_at, metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (pid, m["id"], data.amount_usd, usd_to_ars(data.amount_usd), fee, net,
+         amount_crypto, data.crypto, data.description, data.customer_email,
+         wallet, str(amount_crypto),
+         (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+         datetime.now(timezone.utc).isoformat(), data.metadata),
     )
     db.commit()
     db.close()
 
     return {
-        "payment_id": payment_id,
+        "payment_id": pid,
         "status": "pending",
         "amount_usd": data.amount_usd,
+        "amount_ars": usd_to_ars(data.amount_usd),
+        "fee_usd": fee,
+        "net_usd": net,
         "amount_crypto": amount_crypto,
         "crypto": data.crypto,
         "wallet_address": wallet,
-        "checkout_url": f"{BASE_URL}/checkout/{payment_id}",
-        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+        "checkout_url": f"{BASE_URL}/checkout/{pid}",
+        "expires_in_minutes": 30,
     }
 
 
 @app.get("/v1/payments/{payment_id}")
 def get_payment(payment_id: str, authorization: str = Header(default=None)):
-    key = get_api_key(authorization)
-    merchant = verify_merchant(key)
-
+    m = verify_merchant(get_api_key(authorization))
     db = get_db()
-    payment = db.execute(
-        "SELECT * FROM payments WHERE id = ? AND merchant_id = ?",
-        (payment_id, merchant["id"]),
-    ).fetchone()
+    p = db.execute("SELECT * FROM payments WHERE id=? AND merchant_id=?", (payment_id, m["id"])).fetchone()
     db.close()
-
-    if not payment:
+    if not p:
         raise HTTPException(404, "Pago no encontrado")
-
-    return dict(payment)
+    return dict(p)
 
 
 @app.get("/v1/payments")
-def list_payments(
-    authorization: str = Header(default=None),
-    status: Optional[str] = None,
-    limit: int = Query(default=50, le=200),
-):
-    key = get_api_key(authorization)
-    merchant = verify_merchant(key)
-
+def list_payments(authorization: str = Header(default=None), status: Optional[str] = None, limit: int = Query(default=50, le=200)):
+    m = verify_merchant(get_api_key(authorization))
     db = get_db()
     if status:
-        payments = db.execute(
-            "SELECT * FROM payments WHERE merchant_id = ? AND status = ? ORDER BY created_at DESC LIMIT ?",
-            (merchant["id"], status, limit),
-        ).fetchall()
+        rows = db.execute("SELECT * FROM payments WHERE merchant_id=? AND status=? ORDER BY created_at DESC LIMIT ?",
+                          (m["id"], status, limit)).fetchall()
     else:
-        payments = db.execute(
-            "SELECT * FROM payments WHERE merchant_id = ? ORDER BY created_at DESC LIMIT ?",
-            (merchant["id"], limit),
-        ).fetchall()
+        rows = db.execute("SELECT * FROM payments WHERE merchant_id=? ORDER BY created_at DESC LIMIT ?",
+                          (m["id"], limit)).fetchall()
     db.close()
+    return {"payments": [dict(r) for r in rows], "count": len(rows)}
 
-    return {"payments": [dict(p) for p in payments], "count": len(payments)}
+
+@app.get("/v1/payments/{payment_id}/public")
+def get_payment_public(payment_id: str):
+    db = get_db()
+    p = db.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
+    if not p:
+        db.close()
+        raise HTTPException(404, "Pago no encontrado")
+    m = db.execute("SELECT business_name FROM merchants WHERE id=?", (p["merchant_id"],)).fetchone()
+    db.close()
+    return {
+        "id": p["id"], "amount_usd": p["amount_usd"], "amount_ars": p["amount_ars"],
+        "amount_crypto": p["amount_crypto"], "crypto": p["crypto"],
+        "description": p["description"], "merchant_wallet": p["clubpay_wallet"],
+        "status": p["status"], "expires_at": p["expires_at"], "tx_hash": p["tx_hash"],
+        "business_name": m["business_name"] if m else "",
+    }
+
+
+# ════════════════════════════════════════════
+# ADMIN ENDPOINTS
+# ════════════════════════════════════════════
+@app.get("/v1/admin/stats")
+def admin_stats(authorization: str = Header(default=None)):
+    verify_admin(authorization)
+    db = get_db()
+    total_merchants = db.execute("SELECT COUNT(*) as c FROM merchants").fetchone()["c"]
+    total_payments = db.execute("SELECT COUNT(*) as c FROM payments").fetchone()["c"]
+    confirmed = db.execute("SELECT COUNT(*) as c FROM payments WHERE status='confirmed'").fetchone()["c"]
+    pending = db.execute("SELECT COUNT(*) as c FROM payments WHERE status='pending'").fetchone()["c"]
+
+    vol = db.execute("SELECT COALESCE(SUM(amount_usd),0) as v FROM payments WHERE status='confirmed'").fetchone()["v"]
+    fees = db.execute("SELECT COALESCE(SUM(fee_usd),0) as f FROM payments WHERE status='confirmed'").fetchone()["f"]
+    pending_withdrawals = db.execute("SELECT COUNT(*) as c FROM withdrawals WHERE status='pending'").fetchone()["c"]
+    db.close()
+    return {
+        "total_merchants": total_merchants,
+        "total_payments": total_payments,
+        "confirmed_payments": confirmed,
+        "pending_payments": pending,
+        "volume_usd": round(vol, 2),
+        "volume_ars": usd_to_ars(vol),
+        "total_fees_usd": round(fees, 2),
+        "total_fees_ars": usd_to_ars(fees),
+        "pending_withdrawals": pending_withdrawals,
+        "fee_percent": CLUBPAY_FEE,
+        "blue_ars": PRICES["blue_ars"],
+        "btc_usd": PRICES["btc_usd"],
+    }
+
+
+@app.get("/v1/admin/merchants")
+def admin_merchants(authorization: str = Header(default=None)):
+    verify_admin(authorization)
+    db = get_db()
+    rows = db.execute("SELECT id, email, business_name, balance_usd, total_received_usd, total_fees_usd, created_at, active FROM merchants ORDER BY created_at DESC").fetchall()
+    db.close()
+    return {"merchants": [dict(r) for r in rows]}
+
+
+@app.get("/v1/admin/payments")
+def admin_payments(authorization: str = Header(default=None), limit: int = Query(default=100, le=500)):
+    verify_admin(authorization)
+    db = get_db()
+    rows = db.execute("""
+        SELECT p.*, m.business_name FROM payments p
+        JOIN merchants m ON p.merchant_id = m.id
+        ORDER BY p.created_at DESC LIMIT ?""", (limit,)).fetchall()
+    db.close()
+    return {"payments": [dict(r) for r in rows]}
+
+
+@app.get("/v1/admin/withdrawals")
+def admin_withdrawals(authorization: str = Header(default=None)):
+    verify_admin(authorization)
+    db = get_db()
+    rows = db.execute("""
+        SELECT w.*, m.business_name, m.email FROM withdrawals w
+        JOIN merchants m ON w.merchant_id = m.id
+        ORDER BY w.created_at DESC""").fetchall()
+    db.close()
+    return {"withdrawals": [dict(r) for r in rows]}
+
+
+@app.post("/v1/admin/withdrawals/{wid}/approve")
+def approve_withdrawal(wid: int, authorization: str = Header(default=None)):
+    verify_admin(authorization)
+    db = get_db()
+    w = db.execute("SELECT * FROM withdrawals WHERE id=? AND status='pending'", (wid,)).fetchone()
+    if not w:
+        db.close()
+        raise HTTPException(404, "Retiro no encontrado o ya procesado")
+    db.execute("UPDATE withdrawals SET status='approved', processed_at=? WHERE id=?",
+               (datetime.now(timezone.utc).isoformat(), wid))
+    db.commit()
+    db.close()
+    return {"message": f"Retiro #{wid} aprobado. Enviá {w['amount_usd']} USD en {w['crypto']} a {w['destination_wallet']}"}
+
+
+@app.post("/v1/admin/withdrawals/{wid}/reject")
+def reject_withdrawal(wid: int, authorization: str = Header(default=None)):
+    verify_admin(authorization)
+    db = get_db()
+    w = db.execute("SELECT * FROM withdrawals WHERE id=? AND status='pending'", (wid,)).fetchone()
+    if not w:
+        db.close()
+        raise HTTPException(404, "Retiro no encontrado o ya procesado")
+    # Devolver saldo al comercio
+    db.execute("UPDATE merchants SET balance_usd = balance_usd + ? WHERE id=?", (w["amount_usd"], w["merchant_id"]))
+    db.execute("UPDATE withdrawals SET status='rejected', processed_at=? WHERE id=?",
+               (datetime.now(timezone.utc).isoformat(), wid))
+    db.commit()
+    db.close()
+    return {"message": f"Retiro #{wid} rechazado. Saldo devuelto al comercio."}
 
 
 # ════════════════════════════════════════════
 # BLOCKCHAIN MONITORING
 # ════════════════════════════════════════════
 def check_usdt_trc20(wallet, expected_amount, created_after):
-    """Chequea transferencias USDT TRC-20 a una wallet en Tron."""
     try:
-        # TRC-20 USDT contract en Tron
         usdt_contract = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-        url = f"{TRONGRID_URL}/v1/accounts/{wallet}/transactions/trc20"
-        params = {
-            "only_to": "true",
-            "limit": 20,
-            "contract_address": usdt_contract,
-        }
-        r = req.get(url, params=params, timeout=15)
-        data = r.json().get("data", [])
-
-        for tx in data:
-            # Monto viene en 6 decimales para USDT
+        r = req.get(f"{TRONGRID_URL}/v1/accounts/{wallet}/transactions/trc20",
+                    params={"only_to": "true", "limit": 20, "contract_address": usdt_contract}, timeout=15)
+        for tx in r.json().get("data", []):
             amount = int(tx.get("value", "0")) / 1_000_000
-            tx_time = datetime.fromtimestamp(
-                tx.get("block_timestamp", 0) / 1000, tz=timezone.utc
-            )
-
-            # Verificar que sea después de la creación del pago
-            created_dt = datetime.fromisoformat(created_after)
-            if tx_time < created_dt:
+            tx_time = datetime.fromtimestamp(tx.get("block_timestamp", 0) / 1000, tz=timezone.utc)
+            if tx_time < datetime.fromisoformat(created_after):
                 continue
-
-            # Verificar monto (tolerancia de 0.01 USDT)
             if abs(amount - float(expected_amount)) < 0.01:
                 return tx.get("transaction_id", "")
-
     except Exception:
         pass
     return None
 
 
 def check_btc(wallet, expected_amount, created_after):
-    """Chequea transferencias BTC a una wallet."""
     try:
-        url = f"{BLOCKSTREAM_URL}/address/{wallet}/txs"
-        r = req.get(url, timeout=15)
-        txs = r.json()
-
-        for tx in txs:
+        r = req.get(f"{BLOCKSTREAM_URL}/address/{wallet}/txs", timeout=15)
+        for tx in r.json():
             if not tx.get("status", {}).get("confirmed", False):
                 continue
-
-            tx_time = datetime.fromtimestamp(
-                tx["status"].get("block_time", 0), tz=timezone.utc
-            )
-            created_dt = datetime.fromisoformat(created_after)
-            if tx_time < created_dt:
+            tx_time = datetime.fromtimestamp(tx["status"].get("block_time", 0), tz=timezone.utc)
+            if tx_time < datetime.fromisoformat(created_after):
                 continue
-
-            # Sumar outputs que van a nuestra wallet
-            total_received = 0
-            for vout in tx.get("vout", []):
-                if vout.get("scriptpubkey_address") == wallet:
-                    total_received += vout.get("value", 0)
-
-            # Convertir de satoshis a BTC
-            btc_amount = total_received / 100_000_000
-
-            # Tolerancia de 0.000001 BTC
-            if abs(btc_amount - float(expected_amount)) < 0.000001:
+            total = sum(v.get("value", 0) for v in tx.get("vout", []) if v.get("scriptpubkey_address") == wallet)
+            if abs(total / 100_000_000 - float(expected_amount)) < 0.000001:
                 return tx.get("txid", "")
-
     except Exception:
         pass
     return None
 
 
 def send_webhook(payment, merchant):
-    """Envía webhook al comercio cuando se confirma un pago."""
     if not merchant["webhook_url"]:
         return
     try:
-        req.post(
-            merchant["webhook_url"],
-            json={
-                "event": "payment.confirmed",
-                "payment_id": payment["id"],
-                "amount_usd": payment["amount_usd"],
-                "amount_crypto": payment["amount_crypto"],
-                "crypto": payment["crypto"],
-                "tx_hash": payment["tx_hash"],
-                "status": "confirmed",
-                "paid_at": payment["paid_at"],
-            },
-            headers={"X-ClubPay-Secret": merchant["api_secret"]},
-            timeout=10,
-        )
+        req.post(merchant["webhook_url"], json={
+            "event": "payment.confirmed",
+            "payment_id": payment["id"],
+            "amount_usd": payment["amount_usd"],
+            "amount_ars": payment["amount_ars"],
+            "fee_usd": payment["fee_usd"],
+            "net_usd": payment["net_usd"],
+            "crypto": payment["crypto"],
+            "tx_hash": payment["tx_hash"],
+            "status": "confirmed",
+        }, headers={"X-ClubPay-Secret": merchant["api_secret"]}, timeout=10)
     except Exception:
         pass
 
 
 def payment_monitor():
-    """Loop que chequea pagos pendientes en la blockchain."""
     while True:
         time.sleep(CHECK_INTERVAL)
         try:
             db = get_db()
-            pending = db.execute(
-                "SELECT * FROM payments WHERE status = 'pending'"
-            ).fetchall()
-
+            pending = db.execute("SELECT * FROM payments WHERE status='pending'").fetchall()
             now = datetime.now(timezone.utc)
 
             for p in pending:
                 payment = dict(p)
-                expires = datetime.fromisoformat(payment["expires_at"])
-
-                # Expirar pagos viejos
-                if now > expires:
-                    db.execute(
-                        "UPDATE payments SET status = 'expired' WHERE id = ?",
-                        (payment["id"],),
-                    )
+                if now > datetime.fromisoformat(payment["expires_at"]):
+                    db.execute("UPDATE payments SET status='expired' WHERE id=?", (payment["id"],))
                     db.commit()
                     continue
 
-                # Chequear blockchain
                 tx_hash = None
                 if payment["crypto"] == "usdt_trc20":
-                    tx_hash = check_usdt_trc20(
-                        payment["merchant_wallet"],
-                        payment["expected_amount"],
-                        payment["created_at"],
-                    )
+                    tx_hash = check_usdt_trc20(payment["clubpay_wallet"], payment["expected_amount"], payment["created_at"])
                 elif payment["crypto"] == "btc":
-                    tx_hash = check_btc(
-                        payment["merchant_wallet"],
-                        payment["expected_amount"],
-                        payment["created_at"],
-                    )
+                    tx_hash = check_btc(payment["clubpay_wallet"], payment["expected_amount"], payment["created_at"])
 
                 if tx_hash:
-                    paid_at = datetime.now(timezone.utc).isoformat()
-                    db.execute(
-                        """UPDATE payments
-                        SET status = 'confirmed', tx_hash = ?, paid_at = ?
+                    paid_at = now.isoformat()
+                    # Confirmar pago
+                    db.execute("UPDATE payments SET status='confirmed', tx_hash=?, paid_at=? WHERE id=?",
+                               (tx_hash, paid_at, payment["id"]))
+                    # Acreditar saldo al comercio (monto - comisión)
+                    db.execute("""UPDATE merchants SET
+                        balance_usd = balance_usd + ?,
+                        total_received_usd = total_received_usd + ?,
+                        total_fees_usd = total_fees_usd + ?
                         WHERE id = ?""",
-                        (tx_hash, paid_at, payment["id"]),
-                    )
+                               (payment["net_usd"], payment["amount_usd"], payment["fee_usd"], payment["merchant_id"]))
                     db.commit()
 
-                    # Enviar webhook
-                    merchant = db.execute(
-                        "SELECT * FROM merchants WHERE id = ?",
-                        (payment["merchant_id"],),
-                    ).fetchone()
+                    merchant = db.execute("SELECT * FROM merchants WHERE id=?", (payment["merchant_id"],)).fetchone()
                     if merchant:
                         payment["tx_hash"] = tx_hash
-                        payment["paid_at"] = paid_at
                         send_webhook(payment, dict(merchant))
 
             db.close()
         except Exception:
             pass
-
-    # Actualizar precios
         try:
             fetch_prices()
         except Exception:
@@ -591,12 +692,11 @@ def payment_monitor():
 @app.on_event("startup")
 def startup():
     fetch_prices()
-    thread = threading.Thread(target=payment_monitor, daemon=True)
-    thread.start()
+    threading.Thread(target=payment_monitor, daemon=True).start()
 
 
 # ════════════════════════════════════════════
-# CHECKOUT PAGE (para el comprador)
+# CHECKOUT PAGE
 # ════════════════════════════════════════════
 CHECKOUT_HTML = """<!DOCTYPE html>
 <html lang="es">
@@ -606,7 +706,7 @@ CHECKOUT_HTML = """<!DOCTYPE html>
 <title>ClubPay — Pagar</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#09090B;--card:#18181B;--border:#27272A;--white:#FAFAFA;--dim:#A1A1AA;--green:#22C55E;--red:#EF4444;--blue:#3B82F6;--orange:#F59E0B;--purple:#A855F7}
+:root{--bg:#09090B;--card:#18181B;--border:#27272A;--white:#FAFAFA;--dim:#A1A1AA;--green:#22C55E;--red:#EF4444;--blue:#3B82F6;--orange:#F59E0B}
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:var(--bg);color:var(--white);font-family:'Inter',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
 .container{max-width:480px;width:100%}
@@ -615,17 +715,18 @@ body{background:var(--bg);color:var(--white);font-family:'Inter',sans-serif;min-
 .logo-sub{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);letter-spacing:0.2em;margin-top:4px}
 .card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:32px;margin-bottom:16px}
 .merchant-name{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);letter-spacing:0.15em;margin-bottom:4px}
-.description{font-size:14px;color:var(--white);margin-bottom:20px}
+.description{font-size:14px;margin-bottom:20px}
 .amount-box{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:20px;text-align:center;margin-bottom:24px}
-.amount-usd{font-size:32px;font-weight:800;color:var(--white)}
+.amount-usd{font-size:32px;font-weight:800}
+.amount-ars{font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--dim);margin-top:4px}
 .amount-crypto{font-family:'JetBrains Mono',monospace;font-size:16px;color:var(--green);margin-top:8px}
 .crypto-badge{display:inline-block;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--bg);background:var(--green);border-radius:4px;padding:2px 8px;margin-left:8px;vertical-align:middle}
 .label{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);letter-spacing:0.15em;margin-bottom:8px}
-.wallet-box{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--white);word-break:break-all;cursor:pointer;transition:border-color 0.2s;position:relative}
+.wallet-box{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px;font-family:'JetBrains Mono',monospace;font-size:12px;word-break:break-all;cursor:pointer;transition:border-color 0.2s;position:relative}
 .wallet-box:hover{border-color:var(--green)}
 .wallet-box::after{content:'click para copiar';position:absolute;top:-18px;right:0;font-size:9px;color:var(--dim)}
-.qr-placeholder{text-align:center;margin:20px 0;padding:20px;border:1px dashed var(--border);border-radius:12px}
-.qr-placeholder img{width:200px;height:200px;border-radius:8px}
+.qr-box{text-align:center;margin:20px 0}
+.qr-box img{width:200px;height:200px;border-radius:8px}
 .timer{text-align:center;margin-top:20px}
 .timer-label{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);letter-spacing:0.15em}
 .timer-value{font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:var(--orange);margin-top:4px}
@@ -642,141 +743,48 @@ body{background:var(--bg);color:var(--white);font-family:'Inter',sans-serif;min-
 </head>
 <body>
 <div class="container">
-  <div class="logo">
-    <div class="logo-text">ClubPay</div>
-    <div class="logo-sub">PASARELA CRYPTO</div>
-  </div>
-
+  <div class="logo"><div class="logo-text">ClubPay</div><div class="logo-sub">PASARELA CRYPTO</div></div>
   <div class="card">
     <div class="merchant-name" id="merchantName">CARGANDO...</div>
     <div class="description" id="desc"></div>
-
     <div class="amount-box">
       <div class="amount-usd" id="amountUsd">$0.00 USD</div>
-      <div class="amount-crypto" id="amountCrypto">
-        <span id="cryptoVal">0</span>
-        <span class="crypto-badge" id="cryptoBadge">USDT</span>
-      </div>
+      <div class="amount-ars" id="amountArs"></div>
+      <div class="amount-crypto" id="amountCrypto"><span id="cryptoVal">0</span><span class="crypto-badge" id="cryptoBadge">USDT</span></div>
     </div>
-
-    <div class="label">ENVIAR A ESTA DIRECCION</div>
-    <div class="wallet-box" id="walletBox" onclick="copyWallet()">
-      <span id="walletAddr">...</span>
-    </div>
-
-    <div class="qr-placeholder">
-      <img id="qrImg" src="" alt="QR">
-    </div>
-
-    <div class="timer">
-      <div class="timer-label">EXPIRA EN</div>
-      <div class="timer-value" id="timerVal">30:00</div>
-    </div>
-
-    <div class="status pending" id="statusBox">
-      <span class="spinner"></span> ESPERANDO PAGO...
-    </div>
+    <div class="label">ENVIAR EXACTAMENTE A ESTA DIRECCION</div>
+    <div class="wallet-box" id="walletBox" onclick="copyW()"><span id="walletAddr">...</span></div>
+    <div class="qr-box"><img id="qrImg" src="" alt="QR"></div>
+    <div class="timer"><div class="timer-label">EXPIRA EN</div><div class="timer-value" id="timerVal">30:00</div></div>
+    <div class="status pending" id="statusBox"><span class="spinner"></span> ESPERANDO PAGO...</div>
   </div>
-
   <div class="footer">Powered by ClubPay · 0% comisión al comprador</div>
 </div>
-
 <div class="copied" id="copied">DIRECCION COPIADA</div>
-
 <script>
-var paymentId = window.location.pathname.split('/').pop();
-var paymentData = null;
-var pollInterval = null;
-
-async function loadPayment() {
-    try {
-        var r = await fetch('/v1/payments/' + paymentId + '/public');
-        if (!r.ok) { document.getElementById('merchantName').textContent = 'PAGO NO ENCONTRADO'; return; }
-        paymentData = await r.json();
-        render();
-        if (paymentData.status === 'pending') {
-            pollInterval = setInterval(checkStatus, 15000);
-            startTimer();
-        }
-    } catch(e) {
-        document.getElementById('merchantName').textContent = 'ERROR AL CARGAR';
-    }
-}
-
-function render() {
-    var d = paymentData;
-    document.getElementById('merchantName').textContent = d.business_name || 'COMERCIO';
-    document.getElementById('desc').textContent = d.description || 'Pago';
-    document.getElementById('amountUsd').textContent = '$' + d.amount_usd.toFixed(2) + ' USD';
-    document.getElementById('cryptoVal').textContent = d.amount_crypto;
-
-    var crypto = d.crypto === 'usdt_trc20' ? 'USDT TRC-20' : 'BTC';
-    document.getElementById('cryptoBadge').textContent = crypto;
-    document.getElementById('walletAddr').textContent = d.merchant_wallet;
-
-    // QR
-    var qrData = d.merchant_wallet;
-    document.getElementById('qrImg').src = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(qrData);
-
-    updateStatus(d.status);
-}
-
-function updateStatus(status) {
-    var box = document.getElementById('statusBox');
-    if (status === 'confirmed') {
-        box.className = 'status confirmed';
-        box.innerHTML = 'PAGO CONFIRMADO';
-        if (pollInterval) clearInterval(pollInterval);
-    } else if (status === 'expired') {
-        box.className = 'status expired';
-        box.innerHTML = 'PAGO EXPIRADO';
-        if (pollInterval) clearInterval(pollInterval);
-    } else {
-        box.className = 'status pending';
-        box.innerHTML = '<span class="spinner"></span> ESPERANDO PAGO...';
-    }
-}
-
-async function checkStatus() {
-    try {
-        var r = await fetch('/v1/payments/' + paymentId + '/public');
-        if (r.ok) {
-            var d = await r.json();
-            if (d.status !== 'pending') {
-                paymentData = d;
-                updateStatus(d.status);
-            }
-        }
-    } catch(e) {}
-}
-
-function startTimer() {
-    var expires = new Date(paymentData.expires_at).getTime();
-    setInterval(function() {
-        var now = Date.now();
-        var diff = expires - now;
-        if (diff <= 0) {
-            document.getElementById('timerVal').textContent = '00:00';
-            updateStatus('expired');
-            return;
-        }
-        var mins = Math.floor(diff / 60000);
-        var secs = Math.floor((diff % 60000) / 1000);
-        document.getElementById('timerVal').textContent =
-            String(mins).padStart(2,'0') + ':' + String(secs).padStart(2,'0');
-    }, 1000);
-}
-
-function copyWallet() {
-    if (paymentData) {
-        navigator.clipboard.writeText(paymentData.merchant_wallet);
-        var el = document.getElementById('copied');
-        el.classList.add('show');
-        setTimeout(function(){el.classList.remove('show')},1500);
-    }
-}
-
-loadPayment();
+var pid=window.location.pathname.split('/').pop(),pd=null;
+async function load(){
+  try{var r=await fetch('/v1/payments/'+pid+'/public');if(!r.ok)return;pd=await r.json();render();
+  if(pd.status==='pending'){setInterval(poll,15000);startTimer()}}catch(e){}}
+function render(){
+  document.getElementById('merchantName').textContent=pd.business_name||'COMERCIO';
+  document.getElementById('desc').textContent=pd.description||'Pago';
+  document.getElementById('amountUsd').textContent='$'+pd.amount_usd.toFixed(2)+' USD';
+  document.getElementById('amountArs').textContent=pd.amount_ars?'≈ $'+pd.amount_ars.toLocaleString('es-AR')+' ARS (blue)':'';
+  document.getElementById('cryptoVal').textContent=pd.amount_crypto;
+  document.getElementById('cryptoBadge').textContent=pd.crypto==='usdt_trc20'?'USDT TRC-20':'BTC';
+  document.getElementById('walletAddr').textContent=pd.merchant_wallet;
+  document.getElementById('qrImg').src='https://api.qrserver.com/v1/create-qr-code/?size=200x200&data='+encodeURIComponent(pd.merchant_wallet);
+  updStatus(pd.status)}
+function updStatus(s){var b=document.getElementById('statusBox');
+  if(s==='confirmed'){b.className='status confirmed';b.innerHTML='PAGO CONFIRMADO'}
+  else if(s==='expired'){b.className='status expired';b.innerHTML='PAGO EXPIRADO'}
+  else{b.className='status pending';b.innerHTML='<span class="spinner"></span> ESPERANDO PAGO...'}}
+async function poll(){try{var r=await fetch('/v1/payments/'+pid+'/public');if(r.ok){var d=await r.json();if(d.status!=='pending'){pd=d;updStatus(d.status)}}}catch(e){}}
+function startTimer(){var exp=new Date(pd.expires_at).getTime();setInterval(function(){var d=exp-Date.now();if(d<=0){document.getElementById('timerVal').textContent='00:00';updStatus('expired');return}
+  var m=Math.floor(d/60000),s=Math.floor((d%60000)/1000);document.getElementById('timerVal').textContent=String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')},1000)}
+function copyW(){if(pd){navigator.clipboard.writeText(pd.merchant_wallet);var e=document.getElementById('copied');e.classList.add('show');setTimeout(function(){e.classList.remove('show')},1500)}}
+load();
 </script>
 </body>
 </html>"""
@@ -785,44 +793,15 @@ loadPayment();
 @app.get("/checkout/{payment_id}", response_class=HTMLResponse)
 def checkout_page(payment_id: str):
     db = get_db()
-    payment = db.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+    p = db.execute("SELECT * FROM payments WHERE id=?", (payment_id,)).fetchone()
     db.close()
-    if not payment:
+    if not p:
         raise HTTPException(404, "Pago no encontrado")
     return HTMLResponse(content=CHECKOUT_HTML)
 
 
-@app.get("/v1/payments/{payment_id}/public")
-def get_payment_public(payment_id: str):
-    """Endpoint público para la página de checkout (sin auth)."""
-    db = get_db()
-    payment = db.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
-    if not payment:
-        db.close()
-        raise HTTPException(404, "Pago no encontrado")
-
-    merchant = db.execute(
-        "SELECT business_name FROM merchants WHERE id = ?",
-        (payment["merchant_id"],),
-    ).fetchone()
-    db.close()
-
-    return {
-        "id": payment["id"],
-        "amount_usd": payment["amount_usd"],
-        "amount_crypto": payment["amount_crypto"],
-        "crypto": payment["crypto"],
-        "description": payment["description"],
-        "merchant_wallet": payment["merchant_wallet"],
-        "status": payment["status"],
-        "expires_at": payment["expires_at"],
-        "tx_hash": payment["tx_hash"],
-        "business_name": merchant["business_name"] if merchant else "",
-    }
-
-
 # ════════════════════════════════════════════
-# DASHBOARD (para el comercio)
+# DASHBOARD — COMERCIO
 # ════════════════════════════════════════════
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="es">
@@ -835,38 +814,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 :root{--bg:#09090B;--card:#18181B;--border:#27272A;--white:#FAFAFA;--dim:#A1A1AA;--green:#22C55E;--red:#EF4444;--blue:#3B82F6;--orange:#F59E0B;--purple:#A855F7}
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:var(--bg);color:var(--white);font-family:'Inter',sans-serif;min-height:100vh;padding:20px}
-.header{max-width:900px;margin:0 auto 32px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px}
+.header{max-width:960px;margin:0 auto 32px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px}
 .logo{font-size:24px;font-weight:800;background:linear-gradient(135deg,var(--green),var(--blue));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.nav{display:flex;gap:8px}
-.nav button{font-family:'JetBrains Mono',monospace;font-size:11px;background:var(--card);color:var(--dim);border:1px solid var(--border);border-radius:8px;padding:8px 16px;cursor:pointer;transition:all 0.2s}
+.nav{display:flex;gap:6px;flex-wrap:wrap}
+.nav button{font-family:'JetBrains Mono',monospace;font-size:10px;background:var(--card);color:var(--dim);border:1px solid var(--border);border-radius:8px;padding:8px 14px;cursor:pointer;transition:all 0.2s}
 .nav button:hover,.nav button.active{color:var(--white);border-color:var(--green)}
-.container{max-width:900px;margin:0 auto}
+.container{max-width:960px;margin:0 auto}
 .card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:24px;margin-bottom:16px}
 .card-title{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);letter-spacing:0.2em;margin-bottom:16px}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:24px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
 .stat{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:16px}
-.stat-label{font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--dim);letter-spacing:0.15em;margin-bottom:6px}
-.stat-value{font-size:24px;font-weight:800}
-.stat-value.green{color:var(--green)}
-.stat-value.orange{color:var(--orange)}
-.stat-value.blue{color:var(--blue)}
-input,select{font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg);color:var(--white);border:1px solid var(--border);border-radius:8px;padding:10px 14px;width:100%;margin-bottom:10px;outline:none;transition:border-color 0.2s}
+.stat-label{font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--dim);letter-spacing:0.1em;margin-bottom:6px}
+.stat-value{font-size:22px;font-weight:800}
+.stat-sub{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);margin-top:2px}
+.green{color:var(--green)}.orange{color:var(--orange)}.blue{color:var(--blue)}.red{color:var(--red)}
+input,select{font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg);color:var(--white);border:1px solid var(--border);border-radius:8px;padding:10px 14px;width:100%;margin-bottom:10px;outline:none}
 input:focus{border-color:var(--green)}
 label{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);letter-spacing:0.1em;display:block;margin-bottom:4px}
-button.primary{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;background:var(--green);color:var(--bg);border:none;border-radius:8px;padding:12px 24px;cursor:pointer;transition:opacity 0.2s;width:100%;margin-top:8px}
-button.primary:hover{opacity:0.85}
+.btn{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;background:var(--green);color:var(--bg);border:none;border-radius:8px;padding:12px 24px;cursor:pointer;width:100%;margin-top:8px;transition:opacity 0.2s}
+.btn:hover{opacity:0.85}
+.btn.secondary{background:var(--blue)}
 .table{width:100%;border-collapse:collapse;margin-top:12px}
-.table th,.table td{font-family:'JetBrains Mono',monospace;font-size:11px;text-align:left;padding:10px 12px;border-bottom:1px solid var(--border)}
-.table th{color:var(--dim);font-size:9px;letter-spacing:0.15em}
+.table th,.table td{font-family:'JetBrains Mono',monospace;font-size:10px;text-align:left;padding:10px;border-bottom:1px solid var(--border)}
+.table th{color:var(--dim);font-size:9px;letter-spacing:0.1em}
 .badge{font-family:'JetBrains Mono',monospace;font-size:9px;padding:3px 8px;border-radius:4px;font-weight:700}
 .badge.confirmed{background:rgba(34,197,94,0.15);color:var(--green)}
 .badge.pending{background:rgba(245,158,11,0.15);color:var(--orange)}
 .badge.expired{background:rgba(239,68,68,0.15);color:var(--red)}
-.section{display:none}
-.section.active{display:block}
-.api-key-box{font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;word-break:break-all;color:var(--green);cursor:pointer;margin-bottom:8px}
-
-/* Auth */
+.section{display:none}.section.active{display:block}
+.key-box{font-family:'JetBrains Mono',monospace;font-size:11px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;word-break:break-all;color:var(--green);cursor:pointer;margin-bottom:8px}
 .auth-container{max-width:400px;margin:80px auto}
 .auth-toggle{text-align:center;margin-top:16px;font-size:12px;color:var(--dim)}
 .auth-toggle a{color:var(--green);cursor:pointer;text-decoration:none}
@@ -874,293 +850,297 @@ button.primary:hover{opacity:0.85}
 .msg{font-family:'JetBrains Mono',monospace;font-size:11px;padding:10px;border-radius:8px;margin-bottom:12px;text-align:center}
 .msg.error{background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:var(--red)}
 .msg.success{background:rgba(34,197,94,0.1);border:1px solid rgba(34,197,94,0.3);color:var(--green)}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:600px){.two-col{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
-
-<!-- AUTH SCREEN -->
 <div id="authScreen" class="auth-container">
   <div style="text-align:center;margin-bottom:32px">
     <div class="logo">ClubPay</div>
-    <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);letter-spacing:0.2em;margin-top:4px">DASHBOARD</div>
+    <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);letter-spacing:0.2em;margin-top:4px">DASHBOARD COMERCIO</div>
   </div>
-
   <div class="card" id="loginForm">
     <div class="card-title">INICIAR SESION</div>
     <div id="loginMsg"></div>
-    <label>EMAIL</label>
-    <input type="email" id="loginEmail" placeholder="tu@email.com">
-    <label>PASSWORD</label>
-    <input type="password" id="loginPass" placeholder="••••••">
-    <button class="primary" onclick="doLogin()">ENTRAR</button>
-    <div class="auth-toggle">No tenés cuenta? <a onclick="showRegister()">Registrate</a></div>
+    <label>EMAIL</label><input type="email" id="loginEmail" placeholder="tu@email.com">
+    <label>PASSWORD</label><input type="password" id="loginPass" placeholder="••••••" onkeydown="if(event.key==='Enter')doLogin()">
+    <button class="btn" onclick="doLogin()">ENTRAR</button>
+    <div class="auth-toggle">No tenés cuenta? <a onclick="showReg()">Registrate</a></div>
   </div>
-
-  <div class="card hidden" id="registerForm">
+  <div class="card hidden" id="regForm">
     <div class="card-title">REGISTRAR COMERCIO</div>
     <div id="regMsg"></div>
-    <label>NOMBRE DEL NEGOCIO</label>
-    <input type="text" id="regName" placeholder="Mi Tienda">
-    <label>EMAIL</label>
-    <input type="email" id="regEmail" placeholder="tu@email.com">
-    <label>PASSWORD</label>
-    <input type="password" id="regPass" placeholder="mínimo 6 caracteres">
-    <button class="primary" onclick="doRegister()">CREAR CUENTA</button>
-    <div class="auth-toggle">Ya tenés cuenta? <a onclick="showLogin()">Iniciá sesión</a></div>
+    <label>NOMBRE DEL NEGOCIO</label><input type="text" id="regName" placeholder="Mi Tienda">
+    <label>EMAIL</label><input type="email" id="regEmail" placeholder="tu@email.com">
+    <label>PASSWORD</label><input type="password" id="regPass" placeholder="mínimo 6 caracteres">
+    <button class="btn" onclick="doReg()">CREAR CUENTA</button>
+    <div class="auth-toggle">Ya tenés cuenta? <a onclick="showLog()">Iniciá sesión</a></div>
   </div>
 </div>
 
-<!-- DASHBOARD SCREEN -->
 <div id="dashScreen" class="hidden">
   <div class="header">
     <div class="logo">ClubPay</div>
     <div class="nav">
-      <button class="active" onclick="showSection('overview',this)">RESUMEN</button>
-      <button onclick="showSection('create',this)">NUEVO COBRO</button>
-      <button onclick="showSection('payments',this)">PAGOS</button>
-      <button onclick="showSection('settings',this)">CONFIG</button>
+      <button class="active" onclick="showSec('overview',this)">RESUMEN</button>
+      <button onclick="showSec('create',this)">NUEVO COBRO</button>
+      <button onclick="showSec('payments',this)">PAGOS</button>
+      <button onclick="showSec('withdraw',this)">RETIRAR</button>
+      <button onclick="showSec('settings',this)">CONFIG</button>
       <button onclick="logout()" style="color:var(--red);border-color:var(--red)">SALIR</button>
     </div>
   </div>
-
   <div class="container">
-    <!-- OVERVIEW -->
+
     <div class="section active" id="sec-overview">
       <div class="stats">
-        <div class="stat">
-          <div class="stat-label">TOTAL COBRADO</div>
-          <div class="stat-value green" id="statTotal">$0.00</div>
-        </div>
-        <div class="stat">
-          <div class="stat-label">PAGOS CONFIRMADOS</div>
-          <div class="stat-value blue" id="statConfirmed">0</div>
-        </div>
-        <div class="stat">
-          <div class="stat-label">PENDIENTES</div>
-          <div class="stat-value orange" id="statPending">0</div>
-        </div>
+        <div class="stat"><div class="stat-label">SALDO DISPONIBLE</div><div class="stat-value green" id="sBalance">$0</div><div class="stat-sub" id="sBalanceArs"></div></div>
+        <div class="stat"><div class="stat-label">TOTAL RECIBIDO</div><div class="stat-value blue" id="sReceived">$0</div><div class="stat-sub" id="sReceivedArs"></div></div>
+        <div class="stat"><div class="stat-label">COMISIONES CLUBPAY</div><div class="stat-value orange" id="sFees">$0</div><div class="stat-sub" id="sFeePct"></div></div>
+        <div class="stat"><div class="stat-label">DOLAR BLUE</div><div class="stat-value" id="sBlue" style="color:var(--green)">...</div><div class="stat-sub">ARS por USD</div></div>
       </div>
-      <div class="card">
-        <div class="card-title">TU API KEY</div>
-        <div class="api-key-box" id="apiKeyDisplay" onclick="copyApiKey()">...</div>
-        <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim)">Click para copiar · Usala en el header Authorization: Bearer &lt;key&gt;</div>
-      </div>
+      <div class="card"><div class="card-title">TU API KEY</div><div class="key-box" id="apiKeyBox" onclick="navigator.clipboard.writeText(AK)">...</div>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim)">Click para copiar · Header: Authorization: Bearer &lt;key&gt;</div></div>
     </div>
 
-    <!-- CREATE PAYMENT -->
     <div class="section" id="sec-create">
-      <div class="card">
-        <div class="card-title">CREAR COBRO</div>
-        <div id="createMsg"></div>
-        <label>MONTO (USD)</label>
-        <input type="number" id="createAmount" placeholder="29.00" step="0.01" min="0.01">
-        <label>CRYPTO</label>
-        <select id="createCrypto">
-          <option value="usdt_trc20">USDT (TRC-20)</option>
-          <option value="btc">Bitcoin (BTC)</option>
-        </select>
-        <label>DESCRIPCION (opcional)</label>
-        <input type="text" id="createDesc" placeholder="Producto o servicio">
-        <label>EMAIL CLIENTE (opcional)</label>
-        <input type="email" id="createEmail" placeholder="cliente@email.com">
-        <button class="primary" onclick="createPayment()">GENERAR COBRO</button>
+      <div class="card"><div class="card-title">CREAR COBRO</div><div id="createMsg"></div>
+        <div class="two-col">
+          <div><label>MONTO (USD)</label><input type="number" id="cAmt" placeholder="29.00" step="0.01" min="0.01"></div>
+          <div><label>CRYPTO</label><select id="cCrypto"><option value="usdt_trc20">USDT (TRC-20)</option><option value="btc">Bitcoin (BTC)</option></select></div>
+        </div>
+        <label>DESCRIPCION (opcional)</label><input type="text" id="cDesc" placeholder="Producto o servicio">
+        <label>EMAIL CLIENTE (opcional)</label><input type="email" id="cEmail" placeholder="cliente@email.com">
+        <button class="btn" onclick="createPay()">GENERAR COBRO</button>
       </div>
-      <div class="card hidden" id="createResult">
-        <div class="card-title">COBRO CREADO</div>
-        <label>LINK DE PAGO</label>
-        <div class="api-key-box" id="paymentLink" onclick="copyPayLink()" style="color:var(--blue)">...</div>
-        <label>PAYMENT ID</label>
-        <div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--dim);margin-bottom:12px" id="paymentId">...</div>
-        <button class="primary" onclick="window.open(document.getElementById('paymentLink').textContent,'_blank')">ABRIR CHECKOUT</button>
+      <div class="card hidden" id="createResult"><div class="card-title">COBRO CREADO</div>
+        <label>LINK DE PAGO (compartí con tu cliente)</label>
+        <div class="key-box" id="payLink" onclick="navigator.clipboard.writeText(this.textContent)" style="color:var(--blue)">...</div>
+        <div class="two-col" style="margin-top:12px">
+          <div><div class="stat-label">MONTO</div><div id="payAmt" style="font-size:16px;font-weight:700"></div><div id="payAmtArs" style="font-size:12px;color:var(--dim)"></div></div>
+          <div><div class="stat-label">COMISION CLUBPAY</div><div id="payFee" style="font-size:16px;font-weight:700;color:var(--orange)"></div><div id="payNet" style="font-size:12px;color:var(--green)"></div></div>
+        </div>
+        <button class="btn secondary" onclick="window.open(document.getElementById('payLink').textContent,'_blank')" style="margin-top:16px">ABRIR CHECKOUT</button>
       </div>
     </div>
 
-    <!-- PAYMENTS LIST -->
     <div class="section" id="sec-payments">
-      <div class="card">
-        <div class="card-title">HISTORIAL DE PAGOS</div>
-        <table class="table">
-          <thead><tr><th>ID</th><th>MONTO</th><th>CRYPTO</th><th>ESTADO</th><th>FECHA</th></tr></thead>
-          <tbody id="paymentsTable"></tbody>
-        </table>
+      <div class="card"><div class="card-title">HISTORIAL DE PAGOS</div>
+        <table class="table"><thead><tr><th>ID</th><th>MONTO</th><th>EN PESOS</th><th>CRYPTO</th><th>ESTADO</th><th>FECHA</th></tr></thead>
+        <tbody id="payTable"></tbody></table>
       </div>
     </div>
 
-    <!-- SETTINGS -->
+    <div class="section" id="sec-withdraw">
+      <div class="card"><div class="card-title">RETIRAR FONDOS</div><div id="wMsg"></div>
+        <div class="stat" style="margin-bottom:16px"><div class="stat-label">SALDO DISPONIBLE</div><div class="stat-value green" id="wBalance">$0</div><div class="stat-sub" id="wBalanceArs"></div></div>
+        <label>MONTO A RETIRAR (USD)</label><input type="number" id="wAmt" placeholder="10.00" step="0.01" min="0.01">
+        <label>RETIRAR EN</label><select id="wCrypto"><option value="usdt_trc20">USDT (TRC-20)</option><option value="btc">Bitcoin (BTC)</option></select>
+        <button class="btn" onclick="doWithdraw()">SOLICITAR RETIRO</button>
+      </div>
+    </div>
+
     <div class="section" id="sec-settings">
-      <div class="card">
-        <div class="card-title">WALLETS — donde recibís los pagos</div>
-        <div id="settingsMsg"></div>
-        <label>WALLET USDT (TRC-20 — Red Tron)</label>
-        <input type="text" id="setUsdt" placeholder="T...">
-        <label>WALLET BTC</label>
-        <input type="text" id="setBtc" placeholder="bc1...">
-        <label>WEBHOOK URL (opcional — te avisamos cuando pagan)</label>
-        <input type="url" id="setWebhook" placeholder="https://tu-servidor.com/webhook">
-        <button class="primary" onclick="saveSettings()">GUARDAR</button>
+      <div class="card"><div class="card-title">WALLETS DE RETIRO — donde recibís cuando retirás</div><div id="setMsg"></div>
+        <label>WALLET USDT (TRC-20)</label><input type="text" id="setUsdt" placeholder="T...">
+        <label>WALLET BTC</label><input type="text" id="setBtc" placeholder="bc1...">
+        <label>WEBHOOK URL (te avisamos cuando te pagan)</label><input type="url" id="setWh" placeholder="https://tu-servidor.com/webhook">
+        <button class="btn" onclick="saveSet()">GUARDAR</button>
       </div>
     </div>
   </div>
 </div>
 
 <script>
-var API_KEY = localStorage.getItem('clubpay_key') || '';
-var BASE = '';
-
-// Auth
-function showRegister(){document.getElementById('loginForm').classList.add('hidden');document.getElementById('registerForm').classList.remove('hidden')}
-function showLogin(){document.getElementById('registerForm').classList.add('hidden');document.getElementById('loginForm').classList.remove('hidden')}
-
-async function doRegister(){
-    var name=document.getElementById('regName').value;
-    var email=document.getElementById('regEmail').value;
-    var pass=document.getElementById('regPass').value;
-    if(!name||!email||!pass){showMsg('regMsg','Completá todos los campos','error');return}
-    try{
-        var r=await fetch('/v1/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email,password:pass,business_name:name})});
-        var d=await r.json();
-        if(!r.ok){showMsg('regMsg',d.detail||'Error','error');return}
-        API_KEY=d.api_key;
-        localStorage.setItem('clubpay_key',API_KEY);
-        showMsg('regMsg','Cuenta creada! Guardá tu API Secret: '+d.api_secret,'success');
-        setTimeout(function(){enterDashboard()},3000);
-    }catch(e){showMsg('regMsg','Error de conexión','error')}
-}
-
+var AK=localStorage.getItem('clubpay_key')||'';
+function showReg(){document.getElementById('loginForm').classList.add('hidden');document.getElementById('regForm').classList.remove('hidden')}
+function showLog(){document.getElementById('regForm').classList.add('hidden');document.getElementById('loginForm').classList.remove('hidden')}
+function msg(id,t,c){document.getElementById(id).innerHTML='<div class="msg '+c+'">'+t+'</div>';setTimeout(function(){document.getElementById(id).innerHTML=''},4000)}
+function showSec(n,b){document.querySelectorAll('.section').forEach(function(s){s.classList.remove('active')});document.getElementById('sec-'+n).classList.add('active');document.querySelectorAll('.nav button').forEach(function(x){x.classList.remove('active')});if(b)b.classList.add('active');if(n==='payments')loadPays();if(n==='withdraw')loadBal()}
+async function doReg(){
+  var n=document.getElementById('regName').value,e=document.getElementById('regEmail').value,p=document.getElementById('regPass').value;
+  if(!n||!e||!p){msg('regMsg','Completá todo','error');return}
+  var r=await fetch('/v1/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e,password:p,business_name:n})});
+  var d=await r.json();if(!r.ok){msg('regMsg',d.detail,'error');return}
+  AK=d.api_key;localStorage.setItem('clubpay_key',AK);
+  msg('regMsg','Cuenta creada! API Secret: '+d.api_secret+' — GUARDALO','success');setTimeout(enter,4000)}
 async function doLogin(){
-    var email=document.getElementById('loginEmail').value;
-    var pass=document.getElementById('loginPass').value;
-    if(!email||!pass){showMsg('loginMsg','Completá todos los campos','error');return}
-    try{
-        var r=await fetch('/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email,password:pass})});
-        var d=await r.json();
-        if(!r.ok){showMsg('loginMsg',d.detail||'Error','error');return}
-        API_KEY=d.api_key;
-        localStorage.setItem('clubpay_key',API_KEY);
-        enterDashboard();
-    }catch(e){showMsg('loginMsg','Error de conexión','error')}
-}
-
-function logout(){API_KEY='';localStorage.removeItem('clubpay_key');location.reload()}
-
-function showMsg(id,msg,type){
-    var el=document.getElementById(id);
-    el.innerHTML='<div class="msg '+type+'">'+msg+'</div>';
-    setTimeout(function(){el.innerHTML=''},5000);
-}
-
-// Dashboard
-async function enterDashboard(){
-    document.getElementById('authScreen').classList.add('hidden');
-    document.getElementById('dashScreen').classList.remove('hidden');
-    document.getElementById('apiKeyDisplay').textContent=API_KEY;
-    loadOverview();
-    loadSettings();
-    loadPayments();
-}
-
-function showSection(name,btn){
-    document.querySelectorAll('.section').forEach(function(s){s.classList.remove('active')});
-    document.getElementById('sec-'+name).classList.add('active');
-    document.querySelectorAll('.nav button').forEach(function(b){b.classList.remove('active')});
-    if(btn)btn.classList.add('active');
-}
-
-async function loadOverview(){
-    try{
-        var r=await fetch('/v1/payments',{headers:{'Authorization':'Bearer '+API_KEY}});
-        var d=await r.json();
-        var total=0,confirmed=0,pending=0;
-        d.payments.forEach(function(p){
-            if(p.status==='confirmed'){total+=p.amount_usd;confirmed++}
-            if(p.status==='pending')pending++;
-        });
-        document.getElementById('statTotal').textContent='$'+total.toFixed(2);
-        document.getElementById('statConfirmed').textContent=confirmed;
-        document.getElementById('statPending').textContent=pending;
-    }catch(e){}
-}
-
-async function loadPayments(){
-    try{
-        var r=await fetch('/v1/payments',{headers:{'Authorization':'Bearer '+API_KEY}});
-        var d=await r.json();
-        var html='';
-        d.payments.forEach(function(p){
-            html+='<tr><td>'+p.id.slice(0,12)+'...</td><td>$'+p.amount_usd.toFixed(2)+'</td><td>'+(p.crypto==='usdt_trc20'?'USDT':'BTC')+'</td><td><span class="badge '+p.status+'">'+p.status.toUpperCase()+'</span></td><td>'+new Date(p.created_at).toLocaleDateString()+'</td></tr>';
-        });
-        document.getElementById('paymentsTable').innerHTML=html||'<tr><td colspan="5" style="text-align:center;color:var(--dim)">Sin pagos todavía</td></tr>';
-    }catch(e){}
-}
-
-async function createPayment(){
-    var amount=parseFloat(document.getElementById('createAmount').value);
-    var crypto=document.getElementById('createCrypto').value;
-    var desc=document.getElementById('createDesc').value;
-    var email=document.getElementById('createEmail').value;
-    if(!amount||amount<=0){showMsg('createMsg','Ingresá un monto válido','error');return}
-    try{
-        var r=await fetch('/v1/payments/create',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+API_KEY},body:JSON.stringify({amount_usd:amount,crypto:crypto,description:desc,customer_email:email})});
-        var d=await r.json();
-        if(!r.ok){showMsg('createMsg',d.detail||'Error','error');return}
-        document.getElementById('createResult').classList.remove('hidden');
-        document.getElementById('paymentLink').textContent=d.checkout_url;
-        document.getElementById('paymentId').textContent=d.payment_id;
-        loadOverview();
-        loadPayments();
-    }catch(e){showMsg('createMsg','Error de conexión','error')}
-}
-
-async function loadSettings(){
-    try{
-        var r=await fetch('/v1/merchant/me',{headers:{'Authorization':'Bearer '+API_KEY}});
-        var d=await r.json();
-        document.getElementById('setUsdt').value=d.wallet_usdt_trc20||'';
-        document.getElementById('setBtc').value=d.wallet_btc||'';
-        document.getElementById('setWebhook').value=d.webhook_url||'';
-    }catch(e){}
-}
-
-async function saveSettings(){
-    try{
-        var r=await fetch('/v1/merchant/wallets',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+API_KEY},body:JSON.stringify({wallet_usdt_trc20:document.getElementById('setUsdt').value,wallet_btc:document.getElementById('setBtc').value,webhook_url:document.getElementById('setWebhook').value})});
-        var d=await r.json();
-        if(r.ok)showMsg('settingsMsg','Guardado!','success');
-        else showMsg('settingsMsg',d.detail||'Error','error');
-    }catch(e){showMsg('settingsMsg','Error de conexión','error')}
-}
-
-function copyApiKey(){navigator.clipboard.writeText(API_KEY)}
-function copyPayLink(){navigator.clipboard.writeText(document.getElementById('paymentLink').textContent)}
-
-// Auto-login
-if(API_KEY){enterDashboard()}
+  var e=document.getElementById('loginEmail').value,p=document.getElementById('loginPass').value;
+  if(!e||!p){msg('loginMsg','Completá todo','error');return}
+  var r=await fetch('/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e,password:p})});
+  var d=await r.json();if(!r.ok){msg('loginMsg',d.detail,'error');return}
+  AK=d.api_key;localStorage.setItem('clubpay_key',AK);enter()}
+function logout(){AK='';localStorage.removeItem('clubpay_key');location.reload()}
+async function enter(){
+  document.getElementById('authScreen').classList.add('hidden');document.getElementById('dashScreen').classList.remove('hidden');
+  document.getElementById('apiKeyBox').textContent=AK;loadBal();loadPays();loadSet()}
+async function loadBal(){
+  try{var r=await fetch('/v1/merchant/balance',{headers:{'Authorization':'Bearer '+AK}});var d=await r.json();
+  document.getElementById('sBalance').textContent='$'+d.balance_usd.toFixed(2);
+  document.getElementById('sBalanceArs').textContent='≈ $'+d.balance_ars.toLocaleString('es-AR')+' ARS';
+  document.getElementById('sReceived').textContent='$'+d.total_received_usd.toFixed(2);
+  document.getElementById('sReceivedArs').textContent='≈ $'+d.total_received_ars.toLocaleString('es-AR')+' ARS';
+  document.getElementById('sFees').textContent='$'+d.total_fees_usd.toFixed(2);
+  document.getElementById('sFeePct').textContent=d.fee_percent+'% por tx';
+  document.getElementById('sBlue').textContent='$'+(d.blue_ars||'...');
+  document.getElementById('wBalance').textContent='$'+d.balance_usd.toFixed(2);
+  document.getElementById('wBalanceArs').textContent='≈ $'+d.balance_ars.toLocaleString('es-AR')+' ARS';
+  }catch(e){}}
+async function loadPays(){
+  try{var r=await fetch('/v1/payments',{headers:{'Authorization':'Bearer '+AK}});var d=await r.json();var h='';
+  d.payments.forEach(function(p){h+='<tr><td>'+p.id.slice(0,12)+'</td><td>$'+p.amount_usd.toFixed(2)+'</td><td>$'+(p.amount_ars||0).toLocaleString('es-AR')+'</td><td>'+(p.crypto==='usdt_trc20'?'USDT':'BTC')+'</td><td><span class="badge '+p.status+'">'+p.status.toUpperCase()+'</span></td><td>'+new Date(p.created_at).toLocaleDateString()+'</td></tr>'});
+  document.getElementById('payTable').innerHTML=h||'<tr><td colspan="6" style="text-align:center;color:var(--dim)">Sin pagos</td></tr>';}catch(e){}}
+async function createPay(){
+  var a=parseFloat(document.getElementById('cAmt').value),c=document.getElementById('cCrypto').value,desc=document.getElementById('cDesc').value,em=document.getElementById('cEmail').value;
+  if(!a||a<=0){msg('createMsg','Monto inválido','error');return}
+  var r=await fetch('/v1/payments/create',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+AK},body:JSON.stringify({amount_usd:a,crypto:c,description:desc,customer_email:em})});
+  var d=await r.json();if(!r.ok){msg('createMsg',d.detail,'error');return}
+  document.getElementById('createResult').classList.remove('hidden');
+  document.getElementById('payLink').textContent=d.checkout_url;
+  document.getElementById('payAmt').textContent='$'+d.amount_usd.toFixed(2)+' USD';
+  document.getElementById('payAmtArs').textContent='≈ $'+d.amount_ars.toLocaleString('es-AR')+' ARS';
+  document.getElementById('payFee').textContent='-$'+d.fee_usd.toFixed(2);
+  document.getElementById('payNet').textContent='Recibís: $'+d.net_usd.toFixed(2)+' USD';
+  loadBal();loadPays()}
+async function loadSet(){
+  try{var r=await fetch('/v1/merchant/me',{headers:{'Authorization':'Bearer '+AK}});var d=await r.json();
+  document.getElementById('setUsdt').value=d.wallet_usdt_trc20||'';document.getElementById('setBtc').value=d.wallet_btc||'';document.getElementById('setWh').value=d.webhook_url||'';}catch(e){}}
+async function saveSet(){
+  var r=await fetch('/v1/merchant/wallets',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+AK},body:JSON.stringify({wallet_usdt_trc20:document.getElementById('setUsdt').value,wallet_btc:document.getElementById('setBtc').value,webhook_url:document.getElementById('setWh').value})});
+  if(r.ok)msg('setMsg','Guardado!','success');else msg('setMsg','Error','error')}
+async function doWithdraw(){
+  var a=parseFloat(document.getElementById('wAmt').value),c=document.getElementById('wCrypto').value;
+  if(!a||a<=0){msg('wMsg','Monto inválido','error');return}
+  var r=await fetch('/v1/merchant/withdraw',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+AK},body:JSON.stringify({amount_usd:a,crypto:c})});
+  var d=await r.json();if(!r.ok){msg('wMsg',d.detail,'error');return}
+  msg('wMsg','Retiro solicitado: $'+a.toFixed(2)+' USD en '+c,'success');loadBal()}
+if(AK)enter();
 </script>
 </body>
 </html>"""
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard_page():
+def dashboard():
     return HTMLResponse(content=DASHBOARD_HTML)
 
 
 # ════════════════════════════════════════════
-# ROOT
+# ADMIN DASHBOARD
 # ════════════════════════════════════════════
-@app.get("/")
-def root():
+ADMIN_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ClubPay — Admin</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#09090B;--card:#18181B;--border:#27272A;--white:#FAFAFA;--dim:#A1A1AA;--green:#22C55E;--red:#EF4444;--blue:#3B82F6;--orange:#F59E0B;--purple:#A855F7}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--white);font-family:'Inter',sans-serif;min-height:100vh;padding:20px}
+.header{max-width:960px;margin:0 auto 32px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px}
+.logo{font-size:24px;font-weight:800;background:linear-gradient(135deg,var(--orange),var(--red));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.container{max-width:960px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:24px;margin-bottom:16px}
+.card-title{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);letter-spacing:0.2em;margin-bottom:16px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
+.stat{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:16px}
+.stat-label{font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--dim);letter-spacing:0.1em;margin-bottom:6px}
+.stat-value{font-size:22px;font-weight:800}
+.stat-sub{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);margin-top:2px}
+.green{color:var(--green)}.orange{color:var(--orange)}.blue{color:var(--blue)}.red{color:var(--red)}
+.table{width:100%;border-collapse:collapse;margin-top:12px}
+.table th,.table td{font-family:'JetBrains Mono',monospace;font-size:10px;text-align:left;padding:10px;border-bottom:1px solid var(--border)}
+.table th{color:var(--dim);font-size:9px;letter-spacing:0.1em}
+.badge{font-family:'JetBrains Mono',monospace;font-size:9px;padding:3px 8px;border-radius:4px;font-weight:700}
+.badge.confirmed{background:rgba(34,197,94,0.15);color:var(--green)}
+.badge.pending{background:rgba(245,158,11,0.15);color:var(--orange)}
+.badge.expired{background:rgba(239,68,68,0.15);color:var(--red)}
+.badge.approved{background:rgba(59,130,246,0.15);color:var(--blue)}
+.badge.rejected{background:rgba(239,68,68,0.15);color:var(--red)}
+input{font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg);color:var(--white);border:1px solid var(--border);border-radius:8px;padding:10px 14px;width:100%;max-width:300px;outline:none}
+.btn{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;border:none;border-radius:6px;padding:6px 14px;cursor:pointer;margin:2px}
+.btn-approve{background:var(--green);color:var(--bg)}
+.btn-reject{background:var(--red);color:var(--white)}
+.auth-box{max-width:400px;margin:100px auto;text-align:center}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<div id="authBox" class="auth-box">
+  <div class="logo" style="margin-bottom:16px">ClubPay Admin</div>
+  <input type="password" id="adminPass" placeholder="Admin password" onkeydown="if(event.key==='Enter')adminLogin()">
+  <br><br>
+  <button class="btn btn-approve" onclick="adminLogin()" style="width:200px;padding:12px">ENTRAR</button>
+</div>
+
+<div id="adminDash" class="hidden">
+  <div class="header"><div class="logo">ClubPay Admin</div></div>
+  <div class="container">
+    <div class="stats" id="adminStats"></div>
+    <div class="card"><div class="card-title">RETIROS PENDIENTES</div><table class="table"><thead><tr><th>ID</th><th>COMERCIO</th><th>MONTO</th><th>CRYPTO</th><th>WALLET</th><th>ESTADO</th><th>ACCIONES</th></tr></thead><tbody id="wTable"></tbody></table></div>
+    <div class="card"><div class="card-title">ULTIMOS PAGOS</div><table class="table"><thead><tr><th>ID</th><th>COMERCIO</th><th>MONTO</th><th>EN PESOS</th><th>COMISION</th><th>ESTADO</th><th>FECHA</th></tr></thead><tbody id="aPayTable"></tbody></table></div>
+    <div class="card"><div class="card-title">COMERCIOS</div><table class="table"><thead><tr><th>ID</th><th>NEGOCIO</th><th>EMAIL</th><th>SALDO</th><th>TOTAL RECIBIDO</th><th>FEES GENERADOS</th></tr></thead><tbody id="mTable"></tbody></table></div>
+  </div>
+</div>
+
+<script>
+var AP='';
+function adminLogin(){AP=document.getElementById('adminPass').value;loadAdmin()}
+async function loadAdmin(){
+  try{
+    var r=await fetch('/v1/admin/stats',{headers:{'Authorization':'Bearer '+AP}});
+    if(!r.ok){alert('Password incorrecta');return}
+    var d=await r.json();
+    document.getElementById('authBox').classList.add('hidden');document.getElementById('adminDash').classList.remove('hidden');
+    document.getElementById('adminStats').innerHTML=
+      '<div class="stat"><div class="stat-label">VOLUMEN TOTAL</div><div class="stat-value green">$'+d.volume_usd.toFixed(2)+'</div><div class="stat-sub">≈ $'+(d.volume_ars||0).toLocaleString('es-AR')+' ARS</div></div>'+
+      '<div class="stat"><div class="stat-label">TUS COMISIONES</div><div class="stat-value orange">$'+d.total_fees_usd.toFixed(2)+'</div><div class="stat-sub">≈ $'+(d.total_fees_ars||0).toLocaleString('es-AR')+' ARS</div></div>'+
+      '<div class="stat"><div class="stat-label">COMERCIOS</div><div class="stat-value blue">'+d.total_merchants+'</div></div>'+
+      '<div class="stat"><div class="stat-label">PAGOS CONFIRMADOS</div><div class="stat-value green">'+d.confirmed_payments+'</div></div>'+
+      '<div class="stat"><div class="stat-label">RETIROS PENDIENTES</div><div class="stat-value orange">'+d.pending_withdrawals+'</div></div>'+
+      '<div class="stat"><div class="stat-label">DOLAR BLUE</div><div class="stat-value" style="color:var(--green)">$'+(d.blue_ars||'...')+'</div></div>';
+    loadWithdrawals();loadAdminPays();loadMerchants();
+  }catch(e){alert('Error de conexión')}}
+async function loadWithdrawals(){
+  var r=await fetch('/v1/admin/withdrawals',{headers:{'Authorization':'Bearer '+AP}});var d=await r.json();var h='';
+  d.withdrawals.forEach(function(w){
+    var actions=w.status==='pending'?'<button class="btn btn-approve" onclick="actW('+w.id+\',approve\')">APROBAR</button><button class="btn btn-reject" onclick="actW('+w.id+',\'reject\')">RECHAZAR</button>':'-';
+    h+='<tr><td>#'+w.id+'</td><td>'+w.business_name+'</td><td>$'+w.amount_usd.toFixed(2)+'</td><td>'+w.crypto+'</td><td style="font-size:9px;word-break:break-all">'+w.destination_wallet+'</td><td><span class="badge '+w.status+'">'+w.status.toUpperCase()+'</span></td><td>'+actions+'</td></tr>'});
+  document.getElementById('wTable').innerHTML=h||'<tr><td colspan="7" style="text-align:center;color:var(--dim)">Sin retiros</td></tr>'}
+async function actW(id,action){
+  await fetch('/v1/admin/withdrawals/'+id+'/'+action,{method:'POST',headers:{'Authorization':'Bearer '+AP}});loadAdmin()}
+async function loadAdminPays(){
+  var r=await fetch('/v1/admin/payments',{headers:{'Authorization':'Bearer '+AP}});var d=await r.json();var h='';
+  d.payments.forEach(function(p){h+='<tr><td>'+p.id.slice(0,10)+'</td><td>'+(p.business_name||'')+'</td><td>$'+p.amount_usd.toFixed(2)+'</td><td>$'+(p.amount_ars||0).toLocaleString('es-AR')+'</td><td class="orange">$'+p.fee_usd.toFixed(2)+'</td><td><span class="badge '+p.status+'">'+p.status.toUpperCase()+'</span></td><td>'+new Date(p.created_at).toLocaleDateString()+'</td></tr>'});
+  document.getElementById('aPayTable').innerHTML=h||'<tr><td colspan="7" style="text-align:center;color:var(--dim)">Sin pagos</td></tr>'}
+async function loadMerchants(){
+  var r=await fetch('/v1/admin/merchants',{headers:{'Authorization':'Bearer '+AP}});var d=await r.json();var h='';
+  d.merchants.forEach(function(m){h+='<tr><td>#'+m.id+'</td><td>'+m.business_name+'</td><td>'+m.email+'</td><td class="green">$'+m.balance_usd.toFixed(2)+'</td><td>$'+m.total_received_usd.toFixed(2)+'</td><td class="orange">$'+m.total_fees_usd.toFixed(2)+'</td></tr>'});
+  document.getElementById('mTable').innerHTML=h||'<tr><td colspan="6" style="text-align:center;color:var(--dim)">Sin comercios</td></tr>'}
+</script>
+</body>
+</html>"""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page():
+    return HTMLResponse(content=ADMIN_HTML)
+
+
+# ════════════════════════════════════════════
+# PRICES ENDPOINT
+# ════════════════════════════════════════════
+@app.get("/v1/prices")
+def get_prices():
     return {
-        "name": "ClubPay — Pasarela Crypto",
-        "version": "0.1.0",
-        "description": "Gateway de pagos con criptomonedas. Sin intermediarios. Comisión 1.5%.",
-        "supported_crypto": ["usdt_trc20", "btc"],
-        "endpoints": {
-            "docs": "/docs",
-            "dashboard": "/dashboard",
-            "register": "POST /v1/auth/register",
-            "create_payment": "POST /v1/payments/create",
-        },
+        "btc_usd": PRICES["btc_usd"],
+        "usdt_usd": PRICES["usdt_usd"],
+        "blue_ars": PRICES["blue_ars"],
+        "oficial_ars": PRICES["oficial_ars"],
+        "last_update": PRICES["last_update"],
     }
 
 
