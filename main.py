@@ -59,8 +59,8 @@ DB_PATH = os.getenv("DB_PATH", "./clubpay.db")
 CLUBPAY_FEE = float(os.getenv("CLUBPAY_FEE", "1.5"))  # porcentaje
 
 # WALLETS DE CLUBPAY — acá llegan TODOS los pagos
-CLUBPAY_WALLET_USDT = os.getenv("CLUBPAY_WALLET_USDT", "")  # TRC-20
-CLUBPAY_WALLET_BTC = os.getenv("CLUBPAY_WALLET_BTC", "")
+CLUBPAY_WALLET_USDT = os.getenv("CLUBPAY_WALLET_USDT", "TYbnu4z8bRFiNfHVne4SrDvzit2ompKkNS")  # TRC-20
+CLUBPAY_WALLET_BTC = os.getenv("CLUBPAY_WALLET_BTC", "bc1q7suyvksxv43m7a7pgzvm2re56pk2pwxekvj8dm")
 
 # Admin password
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "clubpay-admin-2026")
