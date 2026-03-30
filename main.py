@@ -62,7 +62,8 @@ CLUBPAY_FEE = float(os.getenv("CLUBPAY_FEE", "1.5"))  # porcentaje
 CLUBPAY_WALLET_USDT = os.getenv("CLUBPAY_WALLET_USDT", "TYbnu4z8bRFiNfHVne4SrDvzit2ompKkNS")  # TRC-20
 CLUBPAY_WALLET_BTC = os.getenv("CLUBPAY_WALLET_BTC", "bc1q7suyvksxv43m7a7pgzvm2re56pk2pwxekvj8dm")
 
-# Admin password
+# Admin credentials
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "gainza.marcos47@gmail.com")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "clubpay-admin-2026")
 
 # APIs blockchain
@@ -199,8 +200,13 @@ def verify_admin(authorization: str = Header(default=None)):
         raise HTTPException(401, "Admin auth required")
     key = authorization.replace("Bearer ", "").strip()
     if key != ADMIN_PASSWORD:
-        raise HTTPException(403, "Admin password incorrecta")
+        raise HTTPException(403, "Credenciales admin incorrectas")
     return True
+
+
+class AdminLoginReq(BaseModel):
+    email: str
+    password: str
 
 
 # ════════════════════════════════════════════
@@ -490,6 +496,15 @@ def get_payment_public(payment_id: str):
 # ════════════════════════════════════════════
 # ADMIN ENDPOINTS
 # ════════════════════════════════════════════
+@app.post("/v1/admin/login")
+def admin_login(data: AdminLoginReq):
+    if data.email.lower().strip() != ADMIN_EMAIL.lower():
+        raise HTTPException(401, "Email o password incorrectos")
+    if data.password != ADMIN_PASSWORD:
+        raise HTTPException(401, "Email o password incorrectos")
+    return {"message": "Admin login exitoso", "token": ADMIN_PASSWORD}
+
+
 @app.get("/v1/admin/stats")
 def admin_stats(authorization: str = Header(default=None)):
     verify_admin(authorization)
@@ -1071,7 +1086,10 @@ input{font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg)
 <body>
 <div id="authBox" class="auth-box">
   <div class="logo" style="margin-bottom:16px">ClubPay Admin</div>
-  <input type="password" id="adminPass" placeholder="Admin password" onkeydown="if(event.key==='Enter')adminLogin()">
+  <div id="adminMsg" style="margin-bottom:12px"></div>
+  <input type="email" id="adminEmail" placeholder="Email admin" style="margin-bottom:10px">
+  <br>
+  <input type="password" id="adminPass" placeholder="Password" onkeydown="if(event.key==='Enter')adminLogin()">
   <br><br>
   <button class="btn btn-approve" onclick="adminLogin()" style="width:200px;padding:12px">ENTRAR</button>
 </div>
@@ -1087,8 +1105,19 @@ input{font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg)
 </div>
 
 <script>
-var AP='';
-function adminLogin(){AP=document.getElementById('adminPass').value;loadAdmin()}
+var AP=localStorage.getItem('clubpay_admin')||'';
+async function adminLogin(){
+  var email=document.getElementById('adminEmail').value;
+  var pass=document.getElementById('adminPass').value;
+  if(!email||!pass){document.getElementById('adminMsg').innerHTML='<div style="color:var(--red);font-size:12px">Completá email y password</div>';return}
+  try{
+    var r=await fetch('/v1/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email,password:pass})});
+    var d=await r.json();
+    if(!r.ok){document.getElementById('adminMsg').innerHTML='<div style="color:var(--red);font-size:12px">'+d.detail+'</div>';return}
+    AP=d.token;localStorage.setItem('clubpay_admin',AP);loadAdmin();
+  }catch(e){document.getElementById('adminMsg').innerHTML='<div style="color:var(--red);font-size:12px">Error de conexión</div>'}
+}
+if(AP)loadAdmin();
 async function loadAdmin(){
   try{
     var r=await fetch('/v1/admin/stats',{headers:{'Authorization':'Bearer '+AP}});
