@@ -234,16 +234,26 @@ def usd_to_ars(usd):
     return 0
 
 
-def usd_to_crypto(amount_usd, crypto):
+def ars_to_usd(ars):
+    if PRICES["blue_ars"] and PRICES["blue_ars"] > 0:
+        return round(ars / PRICES["blue_ars"], 2)
+    return 0
+
+
+def ars_to_crypto(amount_ars, crypto):
+    """Convierte pesos argentinos a crypto usando dólar blue."""
+    usd = ars_to_usd(amount_ars)
+    if usd <= 0:
+        raise HTTPException(503, "No se pudo obtener cotización del dólar blue")
     if crypto == "usdt_trc20":
         unique = secrets.randbelow(99) + 1
-        return round(amount_usd + unique / 10000, 4)
+        return round(usd + unique / 10000, 4)
     elif crypto == "btc":
         if not PRICES["btc_usd"]:
             fetch_prices()
         if not PRICES["btc_usd"]:
             raise HTTPException(503, "No se pudo obtener precio de BTC")
-        btc = amount_usd / PRICES["btc_usd"]
+        btc = usd / PRICES["btc_usd"]
         unique = secrets.randbelow(999) + 1
         return round(btc + unique / 100000000, 8)
     raise HTTPException(400, "Crypto no soportada. Usar: usdt_trc20, btc")
@@ -267,14 +277,14 @@ class WalletReq(BaseModel):
     webhook_url: Optional[str] = ""
 
 class PaymentReq(BaseModel):
-    amount_usd: float
+    amount_ars: float
     crypto: str
     description: Optional[str] = ""
     customer_email: Optional[str] = ""
     metadata: Optional[str] = "{}"
 
 class WithdrawReq(BaseModel):
-    amount_usd: float
+    amount_ars: float
     crypto: str  # a qué crypto quiere retirar
 
 
@@ -369,10 +379,11 @@ def merchant_balance(authorization: str = Header(default=None)):
 @app.post("/v1/merchant/withdraw")
 def request_withdrawal(data: WithdrawReq, authorization: str = Header(default=None)):
     m = verify_merchant(get_api_key(authorization))
-    if data.amount_usd <= 0:
+    amount_usd = ars_to_usd(data.amount_ars)
+    if data.amount_ars <= 0:
         raise HTTPException(400, "Monto debe ser mayor a 0")
-    if data.amount_usd > m["balance_usd"]:
-        raise HTTPException(400, f"Saldo insuficiente. Tenés ${m['balance_usd']:.2f} USD")
+    if amount_usd > m["balance_usd"]:
+        raise HTTPException(400, f"Saldo insuficiente. Tenés ${usd_to_ars(m['balance_usd']):,.0f} ARS")
     if data.crypto == "usdt_trc20" and not m["wallet_usdt_trc20"]:
         raise HTTPException(400, "Configurá tu wallet USDT primero")
     if data.crypto == "btc" and not m["wallet_btc"]:
@@ -381,19 +392,18 @@ def request_withdrawal(data: WithdrawReq, authorization: str = Header(default=No
     dest = m["wallet_usdt_trc20"] if data.crypto == "usdt_trc20" else m["wallet_btc"]
 
     db = get_db()
-    # Descontar del saldo
-    db.execute("UPDATE merchants SET balance_usd = balance_usd - ? WHERE id = ?", (data.amount_usd, m["id"]))
+    db.execute("UPDATE merchants SET balance_usd = balance_usd - ? WHERE id = ?", (amount_usd, m["id"]))
     db.execute(
         """INSERT INTO withdrawals (merchant_id, amount_usd, crypto, destination_wallet, created_at)
         VALUES (?, ?, ?, ?, ?)""",
-        (m["id"], data.amount_usd, data.crypto, dest, datetime.now(timezone.utc).isoformat()),
+        (m["id"], amount_usd, data.crypto, dest, datetime.now(timezone.utc).isoformat()),
     )
     db.commit()
     db.close()
     return {
         "message": "Retiro solicitado. Se procesará en las próximas horas.",
-        "amount_usd": data.amount_usd,
-        "amount_ars": usd_to_ars(data.amount_usd),
+        "amount_ars": data.amount_ars,
+        "amount_usd": amount_usd,
         "crypto": data.crypto,
         "destination": dest,
     }
@@ -405,19 +415,21 @@ def request_withdrawal(data: WithdrawReq, authorization: str = Header(default=No
 @app.post("/v1/payments/create")
 def create_payment(data: PaymentReq, authorization: str = Header(default=None)):
     m = verify_merchant(get_api_key(authorization))
-    if data.amount_usd <= 0:
+    if data.amount_ars <= 0:
         raise HTTPException(400, "Monto debe ser mayor a 0")
 
-    # El pago va a la wallet de ClubPay
     if data.crypto == "usdt_trc20" and not CLUBPAY_WALLET_USDT:
         raise HTTPException(503, "ClubPay USDT wallet no configurada")
     if data.crypto == "btc" and not CLUBPAY_WALLET_BTC:
         raise HTTPException(503, "ClubPay BTC wallet no configurada")
 
     wallet = CLUBPAY_WALLET_USDT if data.crypto == "usdt_trc20" else CLUBPAY_WALLET_BTC
-    amount_crypto = usd_to_crypto(data.amount_usd, data.crypto)
-    fee = round(data.amount_usd * CLUBPAY_FEE / 100, 2)
-    net = round(data.amount_usd - fee, 2)
+    amount_usd = ars_to_usd(data.amount_ars)
+    amount_crypto = ars_to_crypto(data.amount_ars, data.crypto)
+    fee_ars = round(data.amount_ars * CLUBPAY_FEE / 100, 2)
+    fee_usd = round(amount_usd * CLUBPAY_FEE / 100, 2)
+    net_ars = round(data.amount_ars - fee_ars, 2)
+    net_usd = round(amount_usd - fee_usd, 2)
     pid = gen_payment_id()
 
     db = get_db()
@@ -426,7 +438,7 @@ def create_payment(data: PaymentReq, authorization: str = Header(default=None)):
         (id, merchant_id, amount_usd, amount_ars, fee_usd, net_usd, amount_crypto, crypto,
          description, customer_email, clubpay_wallet, expected_amount, expires_at, created_at, metadata)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (pid, m["id"], data.amount_usd, usd_to_ars(data.amount_usd), fee, net,
+        (pid, m["id"], amount_usd, data.amount_ars, fee_usd, net_usd,
          amount_crypto, data.crypto, data.description, data.customer_email,
          wallet, str(amount_crypto),
          (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
@@ -438,15 +450,18 @@ def create_payment(data: PaymentReq, authorization: str = Header(default=None)):
     return {
         "payment_id": pid,
         "status": "pending",
-        "amount_usd": data.amount_usd,
-        "amount_ars": usd_to_ars(data.amount_usd),
-        "fee_usd": fee,
-        "net_usd": net,
+        "amount_ars": data.amount_ars,
+        "amount_usd": amount_usd,
+        "fee_ars": fee_ars,
+        "fee_usd": fee_usd,
+        "net_ars": net_ars,
+        "net_usd": net_usd,
         "amount_crypto": amount_crypto,
         "crypto": data.crypto,
         "wallet_address": wallet,
         "checkout_url": f"{BASE_URL}/checkout/{pid}",
         "expires_in_minutes": 30,
+        "blue_rate": PRICES["blue_ars"],
     }
 
 
@@ -784,8 +799,8 @@ async function load(){
 function render(){
   document.getElementById('merchantName').textContent=pd.business_name||'COMERCIO';
   document.getElementById('desc').textContent=pd.description||'Pago';
-  document.getElementById('amountUsd').textContent='$'+pd.amount_usd.toFixed(2)+' USD';
-  document.getElementById('amountArs').textContent=pd.amount_ars?'≈ $'+pd.amount_ars.toLocaleString('es-AR')+' ARS (blue)':'';
+  document.getElementById('amountUsd').textContent='$'+(pd.amount_ars||0).toLocaleString('es-AR')+' ARS';
+  document.getElementById('amountArs').textContent=pd.amount_usd?'aprox $'+pd.amount_usd.toFixed(2)+' USD (blue)':'';
   document.getElementById('cryptoVal').textContent=pd.amount_crypto;
   document.getElementById('cryptoBadge').textContent=pd.crypto==='usdt_trc20'?'USDT TRC-20':'BTC';
   document.getElementById('walletAddr').textContent=pd.merchant_wallet;
@@ -910,8 +925,8 @@ label{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);let
 
     <div class="section active" id="sec-overview">
       <div class="stats">
-        <div class="stat"><div class="stat-label">SALDO DISPONIBLE</div><div class="stat-value green" id="sBalance">$0</div><div class="stat-sub" id="sBalanceArs"></div></div>
-        <div class="stat"><div class="stat-label">TOTAL RECIBIDO</div><div class="stat-value blue" id="sReceived">$0</div><div class="stat-sub" id="sReceivedArs"></div></div>
+        <div class="stat"><div class="stat-label">SALDO DISPONIBLE</div><div class="stat-value green" id="sBalanceArs">$0</div><div class="stat-sub" id="sBalance"></div></div>
+        <div class="stat"><div class="stat-label">TOTAL RECIBIDO</div><div class="stat-value blue" id="sReceivedArs">$0</div><div class="stat-sub" id="sReceived"></div></div>
         <div class="stat"><div class="stat-label">COMISIONES CLUBPAY</div><div class="stat-value orange" id="sFees">$0</div><div class="stat-sub" id="sFeePct"></div></div>
         <div class="stat"><div class="stat-label">DOLAR BLUE</div><div class="stat-value" id="sBlue" style="color:var(--green)">...</div><div class="stat-sub">ARS por USD</div></div>
       </div>
@@ -922,7 +937,7 @@ label{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);let
     <div class="section" id="sec-create">
       <div class="card"><div class="card-title">CREAR COBRO</div><div id="createMsg"></div>
         <div class="two-col">
-          <div><label>MONTO (USD)</label><input type="number" id="cAmt" placeholder="29.00" step="0.01" min="0.01"></div>
+          <div><label>MONTO ($ PESOS)</label><input type="number" id="cAmt" placeholder="50000" step="1" min="1"></div>
           <div><label>CRYPTO</label><select id="cCrypto"><option value="usdt_trc20">USDT (TRC-20)</option><option value="btc">Bitcoin (BTC)</option></select></div>
         </div>
         <label>DESCRIPCION (opcional)</label><input type="text" id="cDesc" placeholder="Producto o servicio">
@@ -942,7 +957,7 @@ label{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);let
 
     <div class="section" id="sec-payments">
       <div class="card"><div class="card-title">HISTORIAL DE PAGOS</div>
-        <table class="table"><thead><tr><th>ID</th><th>MONTO</th><th>EN PESOS</th><th>CRYPTO</th><th>ESTADO</th><th>FECHA</th></tr></thead>
+        <table class="table"><thead><tr><th>ID</th><th>MONTO ARS</th><th>USD</th><th>CRYPTO</th><th>ESTADO</th><th>FECHA</th></tr></thead>
         <tbody id="payTable"></tbody></table>
       </div>
     </div>
@@ -950,7 +965,7 @@ label{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim);let
     <div class="section" id="sec-withdraw">
       <div class="card"><div class="card-title">RETIRAR FONDOS</div><div id="wMsg"></div>
         <div class="stat" style="margin-bottom:16px"><div class="stat-label">SALDO DISPONIBLE</div><div class="stat-value green" id="wBalance">$0</div><div class="stat-sub" id="wBalanceArs"></div></div>
-        <label>MONTO A RETIRAR (USD)</label><input type="number" id="wAmt" placeholder="10.00" step="0.01" min="0.01">
+        <label>MONTO A RETIRAR ($ PESOS)</label><input type="number" id="wAmt" placeholder="50000" step="1" min="1">
         <label>RETIRAR EN</label><select id="wCrypto"><option value="usdt_trc20">USDT (TRC-20)</option><option value="btc">Bitcoin (BTC)</option></select>
         <button class="btn" onclick="doWithdraw()">SOLICITAR RETIRO</button>
       </div>
@@ -992,31 +1007,31 @@ async function enter(){
   document.getElementById('apiKeyBox').textContent=AK;loadBal();loadPays();loadSet()}
 async function loadBal(){
   try{var r=await fetch('/v1/merchant/balance',{headers:{'Authorization':'Bearer '+AK}});var d=await r.json();
-  document.getElementById('sBalance').textContent='$'+d.balance_usd.toFixed(2);
-  document.getElementById('sBalanceArs').textContent='≈ $'+d.balance_ars.toLocaleString('es-AR')+' ARS';
-  document.getElementById('sReceived').textContent='$'+d.total_received_usd.toFixed(2);
-  document.getElementById('sReceivedArs').textContent='≈ $'+d.total_received_ars.toLocaleString('es-AR')+' ARS';
-  document.getElementById('sFees').textContent='$'+d.total_fees_usd.toFixed(2);
+  document.getElementById('sBalanceArs').textContent='$'+d.balance_ars.toLocaleString('es-AR')+' ARS';
+  document.getElementById('sBalance').textContent='aprox $'+d.balance_usd.toFixed(2)+' USD';
+  document.getElementById('sReceivedArs').textContent='$'+d.total_received_ars.toLocaleString('es-AR')+' ARS';
+  document.getElementById('sReceived').textContent='aprox $'+d.total_received_usd.toFixed(2)+' USD';
+  document.getElementById('sFees').textContent='$'+d.total_fees_ars.toLocaleString('es-AR');
   document.getElementById('sFeePct').textContent=d.fee_percent+'% por tx';
   document.getElementById('sBlue').textContent='$'+(d.blue_ars||'...');
-  document.getElementById('wBalance').textContent='$'+d.balance_usd.toFixed(2);
-  document.getElementById('wBalanceArs').textContent='≈ $'+d.balance_ars.toLocaleString('es-AR')+' ARS';
+  document.getElementById('wBalance').textContent='$'+d.balance_ars.toLocaleString('es-AR')+' ARS';
+  document.getElementById('wBalanceArs').textContent='aprox $'+d.balance_usd.toFixed(2)+' USD';
   }catch(e){}}
 async function loadPays(){
   try{var r=await fetch('/v1/payments',{headers:{'Authorization':'Bearer '+AK}});var d=await r.json();var h='';
-  d.payments.forEach(function(p){h+='<tr><td>'+p.id.slice(0,12)+'</td><td>$'+p.amount_usd.toFixed(2)+'</td><td>$'+(p.amount_ars||0).toLocaleString('es-AR')+'</td><td>'+(p.crypto==='usdt_trc20'?'USDT':'BTC')+'</td><td><span class="badge '+p.status+'">'+p.status.toUpperCase()+'</span></td><td>'+new Date(p.created_at).toLocaleDateString()+'</td></tr>'});
+  d.payments.forEach(function(p){h+='<tr><td>'+p.id.slice(0,12)+'</td><td>$'+(p.amount_ars||0).toLocaleString('es-AR')+'</td><td>$'+(p.amount_usd||0).toFixed(2)+'</td><td>'+(p.crypto==='usdt_trc20'?'USDT':'BTC')+'</td><td><span class="badge '+p.status+'">'+p.status.toUpperCase()+'</span></td><td>'+new Date(p.created_at).toLocaleDateString()+'</td></tr>'});
   document.getElementById('payTable').innerHTML=h||'<tr><td colspan="6" style="text-align:center;color:var(--dim)">Sin pagos</td></tr>';}catch(e){}}
 async function createPay(){
   var a=parseFloat(document.getElementById('cAmt').value),c=document.getElementById('cCrypto').value,desc=document.getElementById('cDesc').value,em=document.getElementById('cEmail').value;
-  if(!a||a<=0){msg('createMsg','Monto inválido','error');return}
-  var r=await fetch('/v1/payments/create',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+AK},body:JSON.stringify({amount_usd:a,crypto:c,description:desc,customer_email:em})});
+  if(!a||a<=0){msg('createMsg','Monto invalido','error');return}
+  var r=await fetch('/v1/payments/create',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+AK},body:JSON.stringify({amount_ars:a,crypto:c,description:desc,customer_email:em})});
   var d=await r.json();if(!r.ok){msg('createMsg',d.detail,'error');return}
   document.getElementById('createResult').classList.remove('hidden');
   document.getElementById('payLink').textContent=d.checkout_url;
-  document.getElementById('payAmt').textContent='$'+d.amount_usd.toFixed(2)+' USD';
-  document.getElementById('payAmtArs').textContent='≈ $'+d.amount_ars.toLocaleString('es-AR')+' ARS';
-  document.getElementById('payFee').textContent='-$'+d.fee_usd.toFixed(2);
-  document.getElementById('payNet').textContent='Recibís: $'+d.net_usd.toFixed(2)+' USD';
+  document.getElementById('payAmt').textContent='$'+d.amount_ars.toLocaleString('es-AR')+' ARS';
+  document.getElementById('payAmtArs').textContent='aprox $'+d.amount_usd.toFixed(2)+' USD (blue $'+d.blue_rate+')';
+  document.getElementById('payFee').textContent='-$'+d.fee_ars.toLocaleString('es-AR');
+  document.getElementById('payNet').textContent='Recibis: $'+d.net_ars.toLocaleString('es-AR')+' ARS';
   loadBal();loadPays()}
 async function loadSet(){
   try{var r=await fetch('/v1/merchant/me',{headers:{'Authorization':'Bearer '+AK}});var d=await r.json();
@@ -1026,10 +1041,10 @@ async function saveSet(){
   if(r.ok)msg('setMsg','Guardado!','success');else msg('setMsg','Error','error')}
 async function doWithdraw(){
   var a=parseFloat(document.getElementById('wAmt').value),c=document.getElementById('wCrypto').value;
-  if(!a||a<=0){msg('wMsg','Monto inválido','error');return}
-  var r=await fetch('/v1/merchant/withdraw',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+AK},body:JSON.stringify({amount_usd:a,crypto:c})});
+  if(!a||a<=0){msg('wMsg','Monto invalido','error');return}
+  var r=await fetch('/v1/merchant/withdraw',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+AK},body:JSON.stringify({amount_ars:a,crypto:c})});
   var d=await r.json();if(!r.ok){msg('wMsg',d.detail,'error');return}
-  msg('wMsg','Retiro solicitado: $'+a.toFixed(2)+' USD en '+c,'success');loadBal()}
+  msg('wMsg','Retiro solicitado: $'+a.toLocaleString('es-AR')+' ARS en '+c,'success');loadBal()}
 if(AK)enter();
 </script>
 </body>
@@ -1099,7 +1114,7 @@ input{font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg)
   <div class="container">
     <div class="stats" id="adminStats"></div>
     <div class="card"><div class="card-title">RETIROS PENDIENTES</div><table class="table"><thead><tr><th>ID</th><th>COMERCIO</th><th>MONTO</th><th>CRYPTO</th><th>WALLET</th><th>ESTADO</th><th>ACCIONES</th></tr></thead><tbody id="wTable"></tbody></table></div>
-    <div class="card"><div class="card-title">ULTIMOS PAGOS</div><table class="table"><thead><tr><th>ID</th><th>COMERCIO</th><th>MONTO</th><th>EN PESOS</th><th>COMISION</th><th>ESTADO</th><th>FECHA</th></tr></thead><tbody id="aPayTable"></tbody></table></div>
+    <div class="card"><div class="card-title">ULTIMOS PAGOS</div><table class="table"><thead><tr><th>ID</th><th>COMERCIO</th><th>MONTO ARS</th><th>USD</th><th>COMISION</th><th>ESTADO</th><th>FECHA</th></tr></thead><tbody id="aPayTable"></tbody></table></div>
     <div class="card"><div class="card-title">COMERCIOS</div><table class="table"><thead><tr><th>ID</th><th>NEGOCIO</th><th>EMAIL</th><th>SALDO</th><th>TOTAL RECIBIDO</th><th>FEES GENERADOS</th></tr></thead><tbody id="mTable"></tbody></table></div>
   </div>
 </div>
@@ -1114,8 +1129,8 @@ async function loadAdmin(){
     var d=await r.json();
     document.getElementById('authBox').classList.add('hidden');document.getElementById('adminDash').classList.remove('hidden');
     document.getElementById('adminStats').innerHTML=
-      '<div class="stat"><div class="stat-label">VOLUMEN TOTAL</div><div class="stat-value green">$'+d.volume_usd.toFixed(2)+'</div><div class="stat-sub">aprox $'+(d.volume_ars||0).toLocaleString('es-AR')+' ARS</div></div>'+
-      '<div class="stat"><div class="stat-label">TUS COMISIONES</div><div class="stat-value orange">$'+d.total_fees_usd.toFixed(2)+'</div><div class="stat-sub">aprox $'+(d.total_fees_ars||0).toLocaleString('es-AR')+' ARS</div></div>'+
+      '<div class="stat"><div class="stat-label">VOLUMEN TOTAL</div><div class="stat-value green">$'+(d.volume_ars||0).toLocaleString('es-AR')+' ARS</div><div class="stat-sub">aprox $'+d.volume_usd.toFixed(2)+' USD</div></div>'+
+      '<div class="stat"><div class="stat-label">TUS COMISIONES</div><div class="stat-value orange">$'+(d.total_fees_ars||0).toLocaleString('es-AR')+' ARS</div><div class="stat-sub">aprox $'+d.total_fees_usd.toFixed(2)+' USD</div></div>'+
       '<div class="stat"><div class="stat-label">COMERCIOS</div><div class="stat-value blue">'+d.total_merchants+'</div></div>'+
       '<div class="stat"><div class="stat-label">PAGOS CONFIRMADOS</div><div class="stat-value green">'+d.confirmed_payments+'</div></div>'+
       '<div class="stat"><div class="stat-label">RETIROS PENDIENTES</div><div class="stat-value orange">'+d.pending_withdrawals+'</div></div>'+
@@ -1145,7 +1160,7 @@ async function actW(id,action){
   await fetch('/v1/admin/withdrawals/'+id+'/'+action,{method:'POST',headers:{'Authorization':'Bearer '+AP}});loadAdmin()}
 async function loadAdminPays(){
   var r=await fetch('/v1/admin/payments',{headers:{'Authorization':'Bearer '+AP}});var d=await r.json();var h='';
-  d.payments.forEach(function(p){h+='<tr><td>'+p.id.slice(0,10)+'</td><td>'+(p.business_name||'')+'</td><td>$'+p.amount_usd.toFixed(2)+'</td><td>$'+(p.amount_ars||0).toLocaleString('es-AR')+'</td><td class="orange">$'+p.fee_usd.toFixed(2)+'</td><td><span class="badge '+p.status+'">'+p.status.toUpperCase()+'</span></td><td>'+new Date(p.created_at).toLocaleDateString()+'</td></tr>'});
+  d.payments.forEach(function(p){h+='<tr><td>'+p.id.slice(0,10)+'</td><td>'+(p.business_name||'')+'</td><td>$'+(p.amount_ars||0).toLocaleString('es-AR')+'</td><td>$'+(p.amount_usd||0).toFixed(2)+'</td><td class="orange">$'+(p.fee_usd||0).toFixed(2)+'</td><td><span class="badge '+p.status+'">'+p.status.toUpperCase()+'</span></td><td>'+new Date(p.created_at).toLocaleDateString()+'</td></tr>'});
   document.getElementById('aPayTable').innerHTML=h||'<tr><td colspan="7" style="text-align:center;color:var(--dim)">Sin pagos</td></tr>'}
 async function loadMerchants(){
   var r=await fetch('/v1/admin/merchants',{headers:{'Authorization':'Bearer '+AP}});var d=await r.json();var h='';
