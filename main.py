@@ -1106,37 +1106,39 @@ input{font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg)
 
 <script>
 var AP=localStorage.getItem('clubpay_admin')||'';
-async function adminLogin(){
-  var email=document.getElementById('adminEmail').value;
-  var pass=document.getElementById('adminPass').value;
-  if(!email||!pass){document.getElementById('adminMsg').innerHTML='<div style="color:var(--red);font-size:12px">Completá email y password</div>';return}
-  try{
-    var r=await fetch('/v1/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email,password:pass})});
-    var d=await r.json();
-    if(!r.ok){document.getElementById('adminMsg').innerHTML='<div style="color:var(--red);font-size:12px">'+d.detail+'</div>';return}
-    AP=d.token;localStorage.setItem('clubpay_admin',AP);loadAdmin();
-  }catch(e){document.getElementById('adminMsg').innerHTML='<div style="color:var(--red);font-size:12px">Error de conexión</div>'}
-}
-if(AP)loadAdmin();
+
 async function loadAdmin(){
   try{
     var r=await fetch('/v1/admin/stats',{headers:{'Authorization':'Bearer '+AP}});
-    if(!r.ok){alert('Password incorrecta');return}
+    if(!r.ok){localStorage.removeItem('clubpay_admin');AP='';return}
     var d=await r.json();
     document.getElementById('authBox').classList.add('hidden');document.getElementById('adminDash').classList.remove('hidden');
     document.getElementById('adminStats').innerHTML=
-      '<div class="stat"><div class="stat-label">VOLUMEN TOTAL</div><div class="stat-value green">$'+d.volume_usd.toFixed(2)+'</div><div class="stat-sub">≈ $'+(d.volume_ars||0).toLocaleString('es-AR')+' ARS</div></div>'+
-      '<div class="stat"><div class="stat-label">TUS COMISIONES</div><div class="stat-value orange">$'+d.total_fees_usd.toFixed(2)+'</div><div class="stat-sub">≈ $'+(d.total_fees_ars||0).toLocaleString('es-AR')+' ARS</div></div>'+
+      '<div class="stat"><div class="stat-label">VOLUMEN TOTAL</div><div class="stat-value green">$'+d.volume_usd.toFixed(2)+'</div><div class="stat-sub">aprox $'+(d.volume_ars||0).toLocaleString('es-AR')+' ARS</div></div>'+
+      '<div class="stat"><div class="stat-label">TUS COMISIONES</div><div class="stat-value orange">$'+d.total_fees_usd.toFixed(2)+'</div><div class="stat-sub">aprox $'+(d.total_fees_ars||0).toLocaleString('es-AR')+' ARS</div></div>'+
       '<div class="stat"><div class="stat-label">COMERCIOS</div><div class="stat-value blue">'+d.total_merchants+'</div></div>'+
       '<div class="stat"><div class="stat-label">PAGOS CONFIRMADOS</div><div class="stat-value green">'+d.confirmed_payments+'</div></div>'+
       '<div class="stat"><div class="stat-label">RETIROS PENDIENTES</div><div class="stat-value orange">'+d.pending_withdrawals+'</div></div>'+
       '<div class="stat"><div class="stat-label">DOLAR BLUE</div><div class="stat-value" style="color:var(--green)">$'+(d.blue_ars||'...')+'</div></div>';
     loadWithdrawals();loadAdminPays();loadMerchants();
-  }catch(e){alert('Error de conexión')}}
+  }catch(e){console.log(e)}}
+
+async function adminLogin(){
+  var email=document.getElementById('adminEmail').value;
+  var pass=document.getElementById('adminPass').value;
+  if(!email||!pass){document.getElementById('adminMsg').innerHTML='<div style="color:var(--red);font-size:12px">Completa email y password</div>';return}
+  try{
+    var r=await fetch('/v1/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email,password:pass})});
+    var d=await r.json();
+    if(!r.ok){document.getElementById('adminMsg').innerHTML='<div style="color:var(--red);font-size:12px">'+d.detail+'</div>';return}
+    AP=d.token;localStorage.setItem('clubpay_admin',AP);loadAdmin();
+  }catch(e){document.getElementById('adminMsg').innerHTML='<div style="color:var(--red);font-size:12px">Error de conexion</div>'}
+}
+
 async function loadWithdrawals(){
   var r=await fetch('/v1/admin/withdrawals',{headers:{'Authorization':'Bearer '+AP}});var d=await r.json();var h='';
   d.withdrawals.forEach(function(w){
-    var actions=w.status==='pending'?'<button class="btn btn-approve" onclick="actW('+w.id+\',approve\')">APROBAR</button><button class="btn btn-reject" onclick="actW('+w.id+',\'reject\')">RECHAZAR</button>':'-';
+    var actions=w.status==='pending'?'<button class="btn btn-approve" onclick="actW('+w.id+',\\\'approve\\\')">APROBAR</button><button class="btn btn-reject" onclick="actW('+w.id+',\\\'reject\\\')">RECHAZAR</button>':'-';
     h+='<tr><td>#'+w.id+'</td><td>'+w.business_name+'</td><td>$'+w.amount_usd.toFixed(2)+'</td><td>'+w.crypto+'</td><td style="font-size:9px;word-break:break-all">'+w.destination_wallet+'</td><td><span class="badge '+w.status+'">'+w.status.toUpperCase()+'</span></td><td>'+actions+'</td></tr>'});
   document.getElementById('wTable').innerHTML=h||'<tr><td colspan="7" style="text-align:center;color:var(--dim)">Sin retiros</td></tr>'}
 async function actW(id,action){
@@ -1149,6 +1151,8 @@ async function loadMerchants(){
   var r=await fetch('/v1/admin/merchants',{headers:{'Authorization':'Bearer '+AP}});var d=await r.json();var h='';
   d.merchants.forEach(function(m){h+='<tr><td>#'+m.id+'</td><td>'+m.business_name+'</td><td>'+m.email+'</td><td class="green">$'+m.balance_usd.toFixed(2)+'</td><td>$'+m.total_received_usd.toFixed(2)+'</td><td class="orange">$'+m.total_fees_usd.toFixed(2)+'</td></tr>'});
   document.getElementById('mTable').innerHTML=h||'<tr><td colspan="6" style="text-align:center;color:var(--dim)">Sin comercios</td></tr>'}
+
+if(AP)loadAdmin();
 </script>
 </body>
 </html>"""
