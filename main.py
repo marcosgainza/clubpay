@@ -1110,7 +1110,7 @@ input{font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg)
 </div>
 
 <div id="adminDash" class="hidden">
-  <div class="header"><div class="logo">ClubPay Admin</div></div>
+  <div class="header"><div class="logo">ClubPay Admin</div><button class="btn btn-reject" onclick="localStorage.removeItem('clubpay_admin');location.reload()" style="width:auto;padding:8px 16px;font-size:11px">CERRAR SESION</button></div>
   <div class="container">
     <div class="stats" id="adminStats"></div>
     <div class="card"><div class="card-title">RETIROS PENDIENTES</div><table class="table"><thead><tr><th>ID</th><th>COMERCIO</th><th>MONTO</th><th>CRYPTO</th><th>WALLET</th><th>ESTADO</th><th>ACCIONES</th></tr></thead><tbody id="wTable"></tbody></table></div>
