@@ -149,6 +149,20 @@ def init_db():
         );
     """)
     db.commit()
+
+    # Auto-migrate: agregar columnas si no existen
+    migrations = [
+        ("payments", "fee_usd", "REAL DEFAULT 0"),
+        ("payments", "net_usd", "REAL DEFAULT 0"),
+        ("payments", "amount_ars", "REAL DEFAULT 0"),
+    ]
+    for table, col, col_type in migrations:
+        try:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+            db.commit()
+        except Exception:
+            pass  # columna ya existe
+
     db.close()
 
 
