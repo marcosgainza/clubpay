@@ -733,6 +733,12 @@ CHECKOUT_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#22C55E">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon-192.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon-192.svg">
 <title>ClubPay — Pagar</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
@@ -768,6 +774,13 @@ body{background:var(--bg);color:var(--white);font-family:'Inter',sans-serif;min-
 .copied{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:var(--green);color:var(--bg);font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;padding:10px 24px;border-radius:8px;opacity:0;transition:opacity 0.3s;pointer-events:none;z-index:100}
 .copied.show{opacity:1}
 .spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--orange);border-top-color:transparent;border-radius:50%;animation:spin 1s linear infinite;vertical-align:middle;margin-right:8px}
+.open-wallet-btn{display:block;text-align:center;background:linear-gradient(135deg,var(--green),var(--blue));color:var(--bg);font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;letter-spacing:0.1em;padding:14px 24px;border-radius:12px;text-decoration:none;margin:16px 0;transition:opacity 0.2s}
+.open-wallet-btn:hover{opacity:0.85}
+.how-to-pay{margin:20px 0;padding:20px;background:var(--bg);border:1px solid var(--border);border-radius:12px}
+.pay-methods{display:flex;flex-direction:column;gap:14px}
+.pay-method{padding:12px;background:var(--card);border:1px solid var(--border);border-radius:8px}
+.pay-method-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;color:var(--green);margin-bottom:6px}
+.pay-method-desc{font-size:12px;color:var(--dim);line-height:1.6}
 @keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
@@ -784,7 +797,21 @@ body{background:var(--bg);color:var(--white);font-family:'Inter',sans-serif;min-
     </div>
     <div class="label">ENVIAR EXACTAMENTE A ESTA DIRECCION</div>
     <div class="wallet-box" id="walletBox" onclick="copyW()"><span id="walletAddr">...</span></div>
-    <div class="qr-box"><img id="qrImg" src="" alt="QR"></div>
+    <div class="qr-box"><a id="qrLink" href="#"><img id="qrImg" src="" alt="QR"></a></div>
+    <a id="openWalletBtn" href="#" class="open-wallet-btn">ABRIR BILLETERA Y PAGAR</a>
+    <div class="how-to-pay">
+      <div class="label">COMO PAGAR</div>
+      <div class="pay-methods">
+        <div class="pay-method">
+          <div class="pay-method-title">Trust Wallet / TronLink</div>
+          <div class="pay-method-desc">Escaneá el QR o tocá el botón de arriba</div>
+        </div>
+        <div class="pay-method">
+          <div class="pay-method-title">Binance / Lemon / Otra</div>
+          <div class="pay-method-desc">1. Copiá la dirección (tocá arriba)<br>2. Abrí tu app → Enviar → <span id="cryptoNetwork">USDT TRC-20</span><br>3. Pegá la dirección y el monto exacto: <strong id="exactAmount">0</strong></div>
+        </div>
+      </div>
+    </div>
     <div class="timer"><div class="timer-label">EXPIRA EN</div><div class="timer-value" id="timerVal">30:00</div></div>
     <div class="status pending" id="statusBox"><span class="spinner"></span> ESPERANDO PAGO...</div>
   </div>
@@ -804,7 +831,14 @@ function render(){
   document.getElementById('cryptoVal').textContent=pd.amount_crypto;
   document.getElementById('cryptoBadge').textContent=pd.crypto==='usdt_trc20'?'USDT TRC-20':'BTC';
   document.getElementById('walletAddr').textContent=pd.merchant_wallet;
-  document.getElementById('qrImg').src='https://api.qrserver.com/v1/create-qr-code/?size=200x200&data='+encodeURIComponent(pd.merchant_wallet);
+  var qrData=pd.merchant_wallet;
+  if(pd.crypto==='btc')qrData='bitcoin:'+pd.merchant_wallet+'?amount='+pd.amount_crypto;
+  else if(pd.crypto==='usdt_trc20')qrData='tron:'+pd.merchant_wallet+'?amount='+pd.amount_crypto;
+  document.getElementById('qrImg').src='https://api.qrserver.com/v1/create-qr-code/?size=200x200&data='+encodeURIComponent(qrData);
+  document.getElementById('qrLink').href=qrData;
+  document.getElementById('openWalletBtn').href=qrData;
+  document.getElementById('cryptoNetwork').textContent=pd.crypto==='usdt_trc20'?'USDT (red TRC-20)':'BTC';
+  document.getElementById('exactAmount').textContent=pd.amount_crypto+' '+(pd.crypto==='usdt_trc20'?'USDT':'BTC');
   updStatus(pd.status)}
 function updStatus(s){var b=document.getElementById('statusBox');
   if(s==='confirmed'){b.className='status confirmed';b.innerHTML='PAGO CONFIRMADO'}
@@ -816,6 +850,7 @@ function startTimer(){var exp=new Date(pd.expires_at).getTime();setInterval(func
 function copyW(){if(pd){navigator.clipboard.writeText(pd.merchant_wallet);var e=document.getElementById('copied');e.classList.add('show');setTimeout(function(){e.classList.remove('show')},1500)}}
 load();
 </script>
+<script>if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js')}</script>
 </body>
 </html>"""
 
@@ -838,6 +873,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#22C55E">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon-192.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon-192.svg">
 <title>ClubPay — Dashboard</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
@@ -1047,6 +1088,7 @@ async function doWithdraw(){
   msg('wMsg','Retiro solicitado: $'+a.toLocaleString('es-AR')+' ARS en '+c,'success');loadBal()}
 if(AK)enter();
 </script>
+<script>if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js')}</script>
 </body>
 </html>"""
 
@@ -1064,6 +1106,12 @@ ADMIN_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#22C55E">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon-192.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon-192.svg">
 <title>ClubPay — Admin</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
@@ -1169,6 +1217,7 @@ async function loadMerchants(){
 
 if(AP)loadAdmin();
 </script>
+<script>if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js')}</script>
 </body>
 </html>"""
 
@@ -1176,6 +1225,89 @@ if(AP)loadAdmin();
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
     return HTMLResponse(content=ADMIN_HTML)
+
+
+# ════════════════════════════════════════════
+# PWA — MANIFEST, SERVICE WORKER, ICON
+# ════════════════════════════════════════════
+PWA_MANIFEST = {
+    "name": "ClubPay",
+    "short_name": "ClubPay",
+    "description": "Pasarela de pagos crypto. Sin intermediarios.",
+    "start_url": "/dashboard",
+    "display": "standalone",
+    "background_color": "#09090B",
+    "theme_color": "#22C55E",
+    "orientation": "portrait-primary",
+    "icons": [
+        {"src": "/icon-192.svg", "sizes": "192x192", "type": "image/svg+xml", "purpose": "any maskable"},
+        {"src": "/icon-512.svg", "sizes": "512x512", "type": "image/svg+xml", "purpose": "any maskable"},
+    ],
+}
+
+PWA_SW_JS = """
+const CACHE_NAME = 'clubpay-v1';
+const PRECACHE = ['/', '/dashboard', '/admin'];
+
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(PRECACHE)));
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
+    )
+  );
+  self.clients.claim();
+});
+
+self.addEventListener('fetch', e => {
+  if (e.request.method !== 'GET') return;
+  e.respondWith(
+    fetch(e.request)
+      .then(res => {
+        const clone = res.clone();
+        caches.open(CACHE_NAME).then(c => c.put(e.request, clone));
+        return res;
+      })
+      .catch(() => caches.match(e.request))
+  );
+});
+""".strip()
+
+PWA_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#09090B"/>
+  <defs>
+    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#22C55E"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+  </defs>
+  <text x="256" y="340" text-anchor="middle" font-family="Arial,sans-serif" font-weight="800" font-size="280" fill="url(#g)">C</text>
+  <text x="256" y="430" text-anchor="middle" font-family="Arial,sans-serif" font-weight="700" font-size="80" fill="#A1A1AA">PAY</text>
+</svg>"""
+
+
+@app.get("/manifest.json")
+def pwa_manifest():
+    return JSONResponse(content=PWA_MANIFEST, media_type="application/manifest+json")
+
+
+@app.get("/sw.js")
+def pwa_service_worker():
+    return HTMLResponse(content=PWA_SW_JS, media_type="application/javascript")
+
+
+@app.get("/icon-192.svg")
+def pwa_icon_192():
+    return HTMLResponse(content=PWA_ICON_SVG, media_type="image/svg+xml")
+
+
+@app.get("/icon-512.svg")
+def pwa_icon_512():
+    return HTMLResponse(content=PWA_ICON_SVG, media_type="image/svg+xml")
 
 
 # ════════════════════════════════════════════
