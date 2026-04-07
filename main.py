@@ -1187,7 +1187,7 @@ ADMIN_HTML = """<!DOCTYPE html>
 <link rel="manifest" href="/manifest.json">
 <link rel="icon" href="/icon-192.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/icon-192.svg">
-<title>ClubPay — Admin</title>
+<title>SalePagos — Admin</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#09090B;--card:#18181B;--border:#27272A;--white:#FAFAFA;--dim:#A1A1AA;--green:#22C55E;--red:#EF4444;--blue:#3B82F6;--orange:#F59E0B;--purple:#A855F7}
@@ -1219,6 +1219,18 @@ input{font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg)
 .btn-reject{background:var(--red);color:var(--white)}
 .auth-box{max-width:400px;margin:100px auto;text-align:center}
 .hidden{display:none}
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+@media(max-width:768px){
+  body{padding:10px}
+  .header{margin-bottom:16px}
+  .logo{font-size:18px}
+  .stats{grid-template-columns:repeat(2,1fr);gap:8px}
+  .stat{padding:12px}
+  .stat-value{font-size:16px}
+  .card{padding:14px;margin-bottom:10px}
+  .table th,.table td{padding:6px 4px;font-size:9px}
+  .btn{font-size:9px;padding:4px 8px}
+}
 </style>
 </head>
 <body>
@@ -1236,9 +1248,9 @@ input{font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg)
   <div class="header"><div class="logo">ClubPay Admin</div><button class="btn btn-reject" onclick="localStorage.removeItem('clubpay_admin');location.reload()" style="width:auto;padding:8px 16px;font-size:11px">CERRAR SESION</button></div>
   <div class="container">
     <div class="stats" id="adminStats"></div>
-    <div class="card"><div class="card-title">RETIROS PENDIENTES</div><table class="table"><thead><tr><th>ID</th><th>COMERCIO</th><th>MONTO</th><th>CRYPTO</th><th>WALLET</th><th>ESTADO</th><th>ACCIONES</th></tr></thead><tbody id="wTable"></tbody></table></div>
-    <div class="card"><div class="card-title">ULTIMOS PAGOS</div><table class="table"><thead><tr><th>ID</th><th>COMERCIO</th><th>MONTO ARS</th><th>USD</th><th>COMISION</th><th>ESTADO</th><th>FECHA</th></tr></thead><tbody id="aPayTable"></tbody></table></div>
-    <div class="card"><div class="card-title">COMERCIOS</div><table class="table"><thead><tr><th>ID</th><th>NEGOCIO</th><th>EMAIL</th><th>SALDO</th><th>TOTAL RECIBIDO</th><th>FEES GENERADOS</th></tr></thead><tbody id="mTable"></tbody></table></div>
+    <div class="card"><div class="card-title">RETIROS PENDIENTES</div><div class="table-wrap"><table class="table"><thead><tr><th>ID</th><th>COMERCIO</th><th>MONTO</th><th>CRYPTO</th><th>WALLET</th><th>ESTADO</th><th>ACCIONES</th></tr></thead><tbody id="wTable"></tbody></table></div></div>
+    <div class="card"><div class="card-title">ULTIMOS PAGOS</div><div class="table-wrap"><table class="table"><thead><tr><th>ID</th><th>COMERCIO</th><th>MONTO ARS</th><th>USD</th><th>COMISION</th><th>ESTADO</th><th>FECHA</th></tr></thead><tbody id="aPayTable"></tbody></table></div></div>
+    <div class="card"><div class="card-title">COMERCIOS</div><div class="table-wrap"><table class="table"><thead><tr><th>ID</th><th>NEGOCIO</th><th>EMAIL</th><th>SALDO</th><th>TOTAL RECIBIDO</th><th>FEES GENERADOS</th></tr></thead><tbody id="mTable"></tbody></table></div></div>
   </div>
 </div>
 
