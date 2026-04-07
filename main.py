@@ -740,6 +740,67 @@ def startup():
 
 
 # ════════════════════════════════════════════
+# LANDING PAGE
+# ════════════════════════════════════════════
+LANDING_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#22C55E">
+<title>SalePagos — Pasarela de Pagos Crypto</title>
+<link rel="icon" href="/icon-192.svg" type="image/svg+xml">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0a0a;--card:#141414;--border:#262626;--green:#22C55E;--blue:#3B82F6;--orange:#F59E0B;--dim:#737373;--text:#fafafa}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.container{max-width:480px;width:100%;text-align:center}
+.logo-text{font-family:'JetBrains Mono',monospace;font-size:28px;font-weight:800;background:linear-gradient(135deg,var(--green),var(--blue));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.logo-sub{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:0.3em;color:var(--dim);margin-top:2px}
+.hero{margin-top:40px}
+.hero h1{font-size:22px;font-weight:800;line-height:1.4}
+.hero p{color:var(--dim);font-size:14px;margin-top:12px;line-height:1.6}
+.features{display:flex;flex-direction:column;gap:12px;margin-top:32px;text-align:left}
+.feature{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px}
+.feature-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;color:var(--green)}
+.feature-desc{font-size:13px;color:var(--dim);margin-top:4px}
+.buttons{display:flex;flex-direction:column;gap:12px;margin-top:32px}
+.btn{display:block;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;letter-spacing:0.05em;padding:16px 24px;border-radius:12px;text-decoration:none;transition:opacity 0.2s}
+.btn:hover{opacity:0.85}
+.btn-primary{background:linear-gradient(135deg,var(--green),var(--blue));color:var(--bg)}
+.btn-secondary{background:var(--card);border:1px solid var(--border);color:var(--text)}
+.footer{margin-top:40px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="logo"><div class="logo-text">SalePagos</div><div class="logo-sub">PASARELA DE PAGOS CRYPTO</div></div>
+  <div class="hero">
+    <h1>Cobrá en crypto,<br>recibí en pesos</h1>
+    <p>Aceptá pagos en USDT y Bitcoin en tu negocio. Sin intermediarios, comisión del 1.5%, y retirá cuando quieras.</p>
+  </div>
+  <div class="features">
+    <div class="feature"><div class="feature-title">SIN INTERMEDIARIOS</div><div class="feature-desc">Los pagos van directo. Vos controlás tu plata.</div></div>
+    <div class="feature"><div class="feature-title">USDT + BITCOIN</div><div class="feature-desc">Aceptá las cryptos más usadas. Conversión automática a pesos.</div></div>
+    <div class="feature"><div class="feature-title">1.5% COMISION</div><div class="feature-desc">La comisión más baja del mercado. Sin costos ocultos.</div></div>
+  </div>
+  <div class="buttons">
+    <a href="/dashboard" class="btn btn-primary">REGISTRARME COMO COMERCIO</a>
+    <a href="/dashboard" class="btn btn-secondary">YA TENGO CUENTA — ENTRAR</a>
+  </div>
+  <div class="footer">SalePagos — Pagos crypto simples y seguros</div>
+</div>
+</body>
+</html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def landing_page():
+    return LANDING_HTML
+
+
+# ════════════════════════════════════════════
 # CHECKOUT PAGE
 # ════════════════════════════════════════════
 CHECKOUT_HTML = """<!DOCTYPE html>
